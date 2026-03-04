@@ -380,6 +380,49 @@ uint8_t masterconn_parselabels(void) {
 	return 0;
 }
 
+static uint8_t masterconn_strieq(const char *a,const char *b) {
+	while (*a && *b) {
+		uint8_t ca,cb;
+		ca = (uint8_t)(*a);
+		cb = (uint8_t)(*b);
+		if (ca>='A' && ca<='Z') {
+			ca += ('a'-'A');
+		}
+		if (cb>='A' && cb<='Z') {
+			cb += ('a'-'A');
+		}
+		if (ca!=cb) {
+			return 0;
+		}
+		a++;
+		b++;
+	}
+	return (*a=='\0' && *b=='\0')?1:0;
+}
+
+uint8_t masterconn_parselabelprecedence(void) {
+	char *precedencestr;
+	uint8_t newprecedence;
+
+	precedencestr = cfg_getstr("LABEL_PRECEDENCE","disk");
+	newprecedence = HDD_LABEL_PRECEDENCE_DISK;
+	if (masterconn_strieq(precedencestr,"disk")) {
+		newprecedence = HDD_LABEL_PRECEDENCE_DISK;
+	} else if (masterconn_strieq(precedencestr,"server")) {
+		newprecedence = HDD_LABEL_PRECEDENCE_SERVER;
+	} else if (masterconn_strieq(precedencestr,"merge")) {
+		newprecedence = HDD_LABEL_PRECEDENCE_MERGE;
+	} else {
+		mfs_log(MFSLOG_SYSLOG_STDERR,MFSLOG_WARNING,"LABEL_PRECEDENCE: unknown value '%s' (allowed: disk,server,merge); using default: disk",precedencestr);
+	}
+	free(precedencestr);
+	if (newprecedence!=LabelPrecedence) {
+		LabelPrecedence = newprecedence;
+		return 1;
+	}
+	return 0;
+}
+
 void masterconn_sendlabels(masterconn *eptr) {
 	uint8_t *buff;
 
@@ -2001,6 +2044,7 @@ void masterconn_term(void) {
 void masterconn_reload(void) {
 	masterconn *eptr = masterconnsingleton;
 	uint32_t ReconnectionDelay;
+	uint8_t precedencechanged;
 	char *newAuthCode;
 	char *newMasterHost;
 	char *newMasterPort;
@@ -2081,6 +2125,14 @@ void masterconn_reload(void) {
 			}
 		}
 	}
+	precedencechanged = masterconn_parselabelprecedence();
+	if (precedencechanged && reconnectisneeded==0) {
+		if (eptr && eptr->mode==DATA && eptr->registerstate==REGISTERED) {
+			masterconn_senddisklabels(eptr);
+		} else {
+			reconnectisneeded = 1;
+		}
+	}
 }
 
 void masterconn_wantexit(void) {
@@ -2127,6 +2179,7 @@ int masterconn_init(void) {
 		Timeout=10;
 	}
 	masterconn_parselabels();
+	masterconn_parselabelprecedence();
 	eptr = masterconnsingleton = malloc(sizeof(masterconn));
 	passert(eptr);
 

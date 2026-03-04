@@ -102,6 +102,9 @@ Changes in this section require only process reload.
 .B LABELS
 labels string defined as a set of letters (case insensitive) separated by coma or semicolon; default is empty - no labels
 .TP
+.B LABEL_PRECEDENCE
+controls how per-disk labels from \fBmfshdd.cfg\fP are combined with chunkserver-level \fBLABELS\fP: \fBdisk\fP (default) means per-disk labels override server labels for entries that define labels, \fBserver\fP means server labels are used for every disk, \fBmerge\fP means union of both sets for each disk
+.TP
 .B BIND_HOST
 local address to use for master connections; default is *, i.e. default local address
 .TP
