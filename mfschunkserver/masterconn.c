@@ -71,6 +71,8 @@
 // force disconnection X seconds after term signal
 #define FORCE_DISCONNECTION_TO 5.0
 
+#define DISK_LABELS_MIN_MASTER_VERSION VERSION2INT(4,59,0)
+
 #define MYSIZE(s,f,a) ((offsetof(s,f)+(a)<sizeof(s))?sizeof(s):(offsetof(s,f)+(a)))
 
 // mode
@@ -153,6 +155,7 @@ static uint16_t ChunkServerID = 0;
 static uint64_t MetaID = 0;
 static char *AuthCode = NULL;
 static uint32_t LabelMask = 0;
+static uint8_t LabelPrecedence = HDD_LABEL_PRECEDENCE_DISK;
 
 static uint64_t hddmetaid;
 
@@ -384,6 +387,18 @@ void masterconn_sendlabels(masterconn *eptr) {
 	put32bit(&buff,LabelMask);
 }
 
+void masterconn_senddisklabels(masterconn *eptr) {
+	uint8_t *buff;
+	uint32_t size;
+
+	if (eptr->masterversion<DISK_LABELS_MIN_MASTER_VERSION) {
+		return;
+	}
+	size = hdd_disklabels_size(LabelMask,LabelPrecedence);
+	buff = masterconn_create_attached_packet(eptr,CSTOMA_DISK_LABELS,size);
+	hdd_disklabels_data(buff,LabelMask,LabelPrecedence);
+}
+
 void masterconn_sendregister(masterconn *eptr) {
 	uint8_t *buff;
 	uint32_t myip;
@@ -507,6 +522,7 @@ void masterconn_master_ack(masterconn *eptr,const uint8_t *data,uint32_t length)
 				eptr->registerstate = INPROGRESS;
 				if (eptr->masterversion>=VERSION2INT(2,1,0)) {
 					masterconn_sendlabels(eptr);
+					masterconn_senddisklabels(eptr);
 				}
 			}
 			if (eptr->registerstate == INPROGRESS) {
@@ -688,6 +704,9 @@ void masterconn_check_hdd_reports(void) {
 		reconnectisneeded = 0;
 	}
 	if (eptr->registerstate==REGISTERED && eptr->mode==DATA) {
+		if (hdd_disklabels_changed()) {
+			masterconn_senddisklabels(eptr);
+		}
 		errorcounter = hdd_errorcounter();
 		while (errorcounter) {
 			masterconn_create_attached_packet(eptr,CSTOMA_ERROR_OCCURRED,0);
@@ -2056,6 +2075,7 @@ void masterconn_reload(void) {
 		if (reconnectisneeded==0) { // we don't want to restart connection
 			if (eptr && eptr->mode==DATA && eptr->registerstate==REGISTERED) {
 				masterconn_sendlabels(eptr);
+				masterconn_senddisklabels(eptr);
 			} else {
 				reconnectisneeded = 1;
 			}

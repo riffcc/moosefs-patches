@@ -1037,6 +1037,9 @@
 #define CSTOMA_CHUNK_NEW (PROTO_BASE+107)
 // N * [ chunkid:64 version:32 ]
 
+// 0x006C
+#define CSTOMA_DISK_LABELS (PROTO_BASE+108)
+// diskcnt:16 diskcnt * [ pathlen:16 path:8[pathlen] labelmask:32 ]
 
 // 0x006D
 #define CSTOMA_LABELS (PROTO_BASE+109)

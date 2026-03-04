@@ -463,6 +463,7 @@ static uint32_t errorcounter = 0;
 static uint8_t hddspacechanged = 0;
 static uint8_t hddspacerecalc = 0;
 static uint8_t global_rebalance_is_on = 0;
+static uint8_t disklabelschanged = 0;
 
 static pthread_t hsrebalancethread,rebalancethread,foldersthread,delayedthread,testerthread,knowndiskusagethread;
 static uint8_t term = 0;
@@ -1035,6 +1036,19 @@ static inline void hdd_stats_datafsync(folder *f,int64_t fsynctime) {
 	zassert(pthread_mutex_unlock(&statslock));
 }
 
+static inline uint32_t hdd_effective_disklabelmask(folder *f,uint32_t serverlabelmask,uint8_t labelprecedence) {
+	if (labelprecedence==HDD_LABEL_PRECEDENCE_SERVER) {
+		return serverlabelmask;
+	}
+	if (labelprecedence==HDD_LABEL_PRECEDENCE_MERGE) {
+		return serverlabelmask | ((f->hasdisklabelmask)?(f->disklabelmask):0);
+	}
+	if (f->hasdisklabelmask) {
+		return f->disklabelmask;
+	}
+	return serverlabelmask;
+}
+
 uint8_t hdd_sendingchunks(void) {
 	folder *f;
 	uint8_t result;
@@ -1239,6 +1253,65 @@ void hdd_diskinfo_monotonic_data(uint8_t *buff) {
 		zassert(pthread_mutex_unlock(&statslock));
 	}
 	zassert(pthread_mutex_unlock(&folderlock));
+}
+
+uint32_t hdd_disklabels_size(uint32_t serverlabelmask,uint8_t labelprecedence) {
+	folder *f;
+	uint32_t size,pathlen;
+
+	(void)serverlabelmask;
+	(void)labelprecedence;
+	size = 2;
+	zassert(pthread_mutex_lock(&folderlock));
+	for (f=folderhead ; f ; f=f->next) {
+		if (f->toremove==REMOVING_NO && f->damaged==0) {
+			pathlen = strlen(f->path);
+			if (pathlen>65535) {
+				pathlen = 65535;
+			}
+			size += 2 + pathlen + 4;
+		}
+	}
+	return size;
+}
+
+void hdd_disklabels_data(uint8_t *buff,uint32_t serverlabelmask,uint8_t labelprecedence) {
+	folder *f;
+	uint32_t pathlen,cnt;
+
+	cnt = 0;
+	for (f=folderhead ; f ; f=f->next) {
+		if (f->toremove==REMOVING_NO && f->damaged==0) {
+			cnt++;
+		}
+	}
+	if (cnt>65535) {
+		cnt = 65535;
+	}
+	put16bit(&buff,cnt);
+	for (f=folderhead ; f && cnt>0 ; f=f->next) {
+		if (f->toremove==REMOVING_NO && f->damaged==0) {
+			pathlen = strlen(f->path);
+			if (pathlen>65535) {
+				pathlen = 65535;
+			}
+			put16bit(&buff,pathlen);
+			memcpy(buff,f->path,pathlen);
+			buff += pathlen;
+			put32bit(&buff,hdd_effective_disklabelmask(f,serverlabelmask,labelprecedence));
+			cnt--;
+		}
+	}
+	zassert(pthread_mutex_unlock(&folderlock));
+}
+
+uint8_t hdd_disklabels_changed(void) {
+	uint8_t r;
+	zassert(pthread_mutex_lock(&folderlock));
+	r = disklabelschanged;
+	disklabelschanged = 0;
+	zassert(pthread_mutex_unlock(&folderlock));
+	return r;
 }
 
 #define OF_BEFORE_OPEN 0
@@ -9075,6 +9148,7 @@ int hdd_folders_reinit(void) {
 			mfs_log(MFSLOG_SYSLOG,MFSLOG_INFO,"hdd space manager: folder %s will be removed",f->path);
 		}
 	}
+	disklabelschanged = 1;
 	folderactions = 1; // continue folder actions
 	zassert(pthread_mutex_unlock(&folderlock));
 

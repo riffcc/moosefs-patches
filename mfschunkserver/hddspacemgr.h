@@ -56,6 +56,14 @@ uint32_t hdd_diskinfo_size(void);
 void hdd_diskinfo_data(uint8_t *buff);
 uint32_t hdd_diskinfo_monotonic_size(void);
 void hdd_diskinfo_monotonic_data(uint8_t *buff);
+
+#define HDD_LABEL_PRECEDENCE_DISK 0
+#define HDD_LABEL_PRECEDENCE_SERVER 1
+#define HDD_LABEL_PRECEDENCE_MERGE 2
+uint32_t hdd_disklabels_size(uint32_t serverlabelmask,uint8_t labelprecedence);
+void hdd_disklabels_data(uint8_t *buff,uint32_t serverlabelmask,uint8_t labelprecedence);
+uint8_t hdd_disklabels_changed(void);
+
 /* lock/unlock pair */
 void hdd_get_chunks_begin(uint8_t partialmode);
 void hdd_get_chunks_end(void);
