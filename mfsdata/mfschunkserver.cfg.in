@@ -105,6 +105,12 @@
 # labels string (default is empty - no labels); labels should be defined as a set of letters (case insensitive) separated by ',' or ';'
 # LABELS = 
 
+# controls precedence of per-disk labels from mfshdd.cfg over LABELS:
+# disk   - per-disk labels override LABELS for entries that define [labels=...] (default)
+# server - LABELS apply to all disks, ignore per-disk overrides
+# merge  - effective disk labels are union of LABELS and per-disk labels
+# LABEL_PRECEDENCE = disk
+
 # local address to use for master connections (default is *, i.e. default local address)
 # BIND_HOST = *
 
@@ -135,4 +141,3 @@
 
 # port to listen for client (mount) connections (default is @DEFAULT_CS_DATA_PORT@)
 # CSSERV_LISTEN_PORT = @DEFAULT_CS_DATA_PORT@
-
