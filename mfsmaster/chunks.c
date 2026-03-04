@@ -945,7 +945,7 @@ int32_t* do_advanced_match(const storagemode *sm,uint32_t servcnt,const uint16_t
 		} else if (sm->uniqmask & UNIQ_MASK_RACK) {
 			sid = topology_get_rackid(matocsserv_server_get_ip(cstab[servers[i]].ptr));
 		} else {
-			sid = matocsserv_server_get_labelmask(cstab[servers[i]].ptr) & sm->uniqmask;
+			sid = matocsserv_server_get_effective_labelmask(cstab[servers[i]].ptr) & sm->uniqmask;
 		}
 		if (sid==0) {
 			group[i] = i;
@@ -8264,7 +8264,7 @@ void chunk_do_jobs(chunk *c,uint8_t mode,uint32_t now,uint8_t extrajob) {
 									break;
 								}
 							} else if (sm->uniqmask) {
-								if ((matocsserv_server_get_labelmask(cstab[servers[k]].ptr) & (sm->uniqmask)) == (matocsserv_server_get_labelmask(cstab[dcsids[j]].ptr) & (sm->uniqmask))) { // we have copy on server with the same uniq labels - can't use
+								if ((matocsserv_server_get_effective_labelmask(cstab[servers[k]].ptr) & (sm->uniqmask)) == (matocsserv_server_get_effective_labelmask(cstab[dcsids[j]].ptr) & (sm->uniqmask))) { // we have copy on server with the same uniq labels - can't use
 									break;
 								}
 							}

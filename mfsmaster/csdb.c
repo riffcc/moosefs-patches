@@ -350,10 +350,10 @@ uint32_t csdb_servlist_data(uint8_t mode,uint8_t *ptr,uint32_t clientip) {
 				}
 				p = ptr;
 				if (csptr->eptr) {
-					uint32_t version,chunkscount,tdchunkscount,errorcounter,load,labelmask;
+					uint32_t version,chunkscount,tdchunkscount,errorcounter,load,effectivelabelmask;
 					uint64_t usedspace,totalspace,tdusedspace,tdtotalspace;
 					uint8_t hlstatus,mfrstatus;
-					matocsserv_getservdata(csptr->eptr,&version,&usedspace,&totalspace,&chunkscount,&tdusedspace,&tdtotalspace,&tdchunkscount,&errorcounter,&load,&hlstatus,&labelmask,&mfrstatus);
+					matocsserv_getservdata(csptr->eptr,&version,&usedspace,&totalspace,&chunkscount,&tdusedspace,&tdtotalspace,&tdchunkscount,&errorcounter,&load,&hlstatus,&effectivelabelmask,&mfrstatus);
 					if (hlstatus==HLSTATUS_OK) {
 						gracetime = 0;
 					} else if (hlstatus==HLSTATUS_OVERLOADED) {
@@ -377,7 +377,7 @@ uint32_t csdb_servlist_data(uint8_t mode,uint8_t *ptr,uint32_t clientip) {
 					put32bit(&ptr,errorcounter);
 					put32bit(&ptr,load);
 					put32bit(&ptr,gracetime);
-					put32bit(&ptr,labelmask);
+					put32bit(&ptr,effectivelabelmask);
 					put8bit(&ptr,mfrstatus);
 				} else {
 					put32bit(&ptr,0);

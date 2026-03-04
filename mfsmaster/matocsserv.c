@@ -116,6 +116,11 @@ typedef struct in_packetstruct {
 	uint8_t data[1];
 } in_packetstruct;
 
+typedef struct disklabelentry {
+	char *path;
+	uint32_t labelmask;
+} disklabelentry;
+
 typedef struct matocsserventry {
 	uint8_t mode;
 	int sock;
@@ -151,6 +156,9 @@ typedef struct matocsserventry {
 
 	uint32_t labelmask;
 	char *labelstr;
+	uint32_t disklabelmask;
+	uint16_t disklabelscnt;
+	disklabelentry *disklabels;
 
 	uint32_t create_total_counter;
 	uint32_t rrep_total_counter;
@@ -1082,6 +1090,15 @@ uint8_t matocsserv_server_matches_labelexpr(void *e,const uint8_t labelexpr[SCLA
 	matocsserventry *eptr = (matocsserventry*)e;
 
 	if (eptr!=NULL) {
+		uint16_t i;
+		if (eptr->disklabelscnt>0 && eptr->disklabels!=NULL) {
+			for (i=0 ; i<eptr->disklabelscnt ; i++) {
+				if (labelmask_matches_labelexpr(eptr->disklabels[i].labelmask,labelexpr)) {
+					return 1;
+				}
+			}
+			return 0;
+		}
 		return labelmask_matches_labelexpr(eptr->labelmask,labelexpr);
 	}
 	return 0;
@@ -1107,7 +1124,7 @@ uint16_t matocsserv_servers_with_label(uint8_t label) {
 	cnt = 0;
 	for (eptr = matocsservhead ; eptr ; eptr=eptr->next) {
 		if (eptr->mode!=KILL && eptr->totalspace>0 && eptr->usedspace<=eptr->totalspace && eptr->csptr!=NULL) {
-			if (eptr->labelmask & (1<<label)) {
+			if (matocsserv_server_get_effective_labelmask(eptr) & (1<<label)) {
 				cnt++;
 			}
 		}
@@ -1118,6 +1135,11 @@ uint16_t matocsserv_servers_with_label(uint8_t label) {
 uint32_t matocsserv_server_get_labelmask(void *e) {
 	matocsserventry *eptr = (matocsserventry *)e;
 	return eptr->labelmask;
+}
+
+uint32_t matocsserv_server_get_effective_labelmask(void *e) {
+	matocsserventry *eptr = (matocsserventry *)e;
+	return (eptr->disklabelscnt>0)?(eptr->disklabelmask):(eptr->labelmask);
 }
 
 const char* matocsserv_server_get_labelstr(void *e) {
@@ -1661,7 +1683,7 @@ int matocsserv_get_csdata(void *e,uint32_t clientip,uint32_t *servip,uint16_t *s
 			*servver = eptr->version;
 		}
 		if (servlabelmask!=NULL) {
-			*servlabelmask = eptr->labelmask;
+			*servlabelmask = matocsserv_server_get_effective_labelmask(eptr);
 		}
 		return 0;
 	}
@@ -1681,7 +1703,7 @@ void matocsserv_getservdata(void *e,uint32_t *ver,uint64_t *uspc,uint64_t *tspc,
 		*errcnt = eptr->errorcounter;
 		*load = eptr->load;
 		*hlstatus = eptr->hlstatus;
-		*labelmask = eptr->labelmask;
+		*labelmask = matocsserv_server_get_effective_labelmask(eptr);
 		*mfrstatus = chunk_get_mfrstatus(eptr->csid);
 	} else {
 		*ver = 0;
@@ -2738,6 +2760,20 @@ uint8_t matocsserv_csdb_force_disconnect(void *e,void *p) {
 	return 0;
 }
 
+static void matocsserv_clear_disklabels(matocsserventry *eptr) {
+	uint16_t i;
+	if (eptr->disklabels) {
+		for (i=0 ; i<eptr->disklabelscnt ; i++) {
+			if (eptr->disklabels[i].path) {
+				free(eptr->disklabels[i].path);
+			}
+		}
+		free(eptr->disklabels);
+	}
+	eptr->disklabels = NULL;
+	eptr->disklabelscnt = 0;
+	eptr->disklabelmask = 0;
+}
 
 void matocsserv_labels(matocsserventry *eptr,const uint8_t *data,uint32_t length) {
 	uint32_t i,l;
@@ -2775,6 +2811,78 @@ void matocsserv_labels(matocsserventry *eptr,const uint8_t *data,uint32_t length
 		}
 	}
 	eptr->labelstr[l]=0;
+}
+
+void matocsserv_disklabels(matocsserventry *eptr,const uint8_t *data,uint32_t length) {
+	uint16_t diskcnt,i;
+	uint16_t pathlen;
+	uint8_t *path;
+	disklabelentry *newlabels;
+
+	if (length<2) {
+		mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CSTOMA_DISK_LABELS - wrong size (%"PRIu32"/>=2)",length);
+		eptr->mode = KILL;
+		return;
+	}
+	passert(data);
+	diskcnt = get16bit(&data);
+	length -= 2;
+	{
+		const uint8_t *tptr;
+		uint32_t tleng;
+		tptr = data;
+		tleng = length;
+		for (i=0 ; i<diskcnt ; i++) {
+			if (tleng<2) {
+				mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CSTOMA_DISK_LABELS - wrong size (missing path length)");
+				eptr->mode = KILL;
+				return;
+			}
+			pathlen = get16bit(&tptr);
+			tleng -= 2;
+			if (tleng<pathlen+4) {
+				mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CSTOMA_DISK_LABELS - wrong size (truncated disk entry)");
+				eptr->mode = KILL;
+				return;
+			}
+			tptr += pathlen + 4;
+			tleng -= pathlen + 4;
+		}
+		if (tleng!=0) {
+			mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CSTOMA_DISK_LABELS - wrong size (trailing bytes: %"PRIu32")",tleng);
+			eptr->mode = KILL;
+			return;
+		}
+	}
+	if (diskcnt==0) {
+		matocsserv_clear_disklabels(eptr);
+		return;
+	}
+	newlabels = malloc(sizeof(disklabelentry)*(uint32_t)diskcnt);
+	passert(newlabels);
+	for (i=0 ; i<diskcnt ; i++) {
+		newlabels[i].path = NULL;
+		newlabels[i].labelmask = 0;
+	}
+	for (i=0 ; i<diskcnt ; i++) {
+		pathlen = get16bit(&data);
+		path = malloc((uint32_t)pathlen+1);
+		passert(path);
+		if (pathlen>0) {
+			memcpy(path,data,pathlen);
+			data += pathlen;
+		}
+		path[pathlen] = 0;
+		newlabels[i].path = (char*)path;
+		newlabels[i].labelmask = get32bit(&data);
+	}
+	matocsserv_clear_disklabels(eptr);
+	eptr->disklabels = newlabels;
+	eptr->disklabelscnt = diskcnt;
+	eptr->disklabelmask = 0;
+	for (i=0 ; i<diskcnt ; i++) {
+		eptr->disklabelmask |= newlabels[i].labelmask;
+	}
 }
 
 void matocsserv_space(matocsserventry *eptr,const uint8_t *data,uint32_t length) {
@@ -3023,6 +3131,10 @@ void matocsserv_disconnection_finished(void *e) {
 	if (eptr->servdesc) {
 		free(eptr->servdesc);
 	}
+	if (eptr->labelstr) {
+		free(eptr->labelstr);
+	}
+	matocsserv_clear_disklabels(eptr);
 	free(eptr);
 }
 
@@ -3080,6 +3192,9 @@ void matocsserv_gotpacket(matocsserventry *eptr,uint32_t type,const uint8_t *dat
 			break;
 		case CSTOMA_LABELS:
 			matocsserv_labels(eptr,data,length);
+			break;
+		case CSTOMA_DISK_LABELS:
+			matocsserv_disklabels(eptr,data,length);
 			break;
 		case CSTOAN_CHUNK_CHECKSUM:
 			matocsserv_got_chunk_checksum(eptr,data,length);
@@ -3481,6 +3596,9 @@ void matocsserv_serve(struct pollfd *pdesc) {
 
 			eptr->labelmask = 0;
 			eptr->labelstr = NULL;
+			eptr->disklabelmask = 0;
+			eptr->disklabelscnt = 0;
+			eptr->disklabels = NULL;
 
 			eptr->create_total_counter = 0;
 			eptr->rrep_total_counter = 0;

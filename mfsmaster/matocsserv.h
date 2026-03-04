@@ -80,6 +80,7 @@ enum {
 
 uint8_t matocsserv_server_matches_labelexpr(void *e,const uint8_t labelexpr[SCLASS_EXPR_MAX_SIZE]);
 uint32_t matocsserv_server_get_labelmask(void *e);
+uint32_t matocsserv_server_get_effective_labelmask(void *e);
 uint32_t matocsserv_server_get_ip(void *e);
 uint16_t matocsserv_servers_matches_labelexpr(const uint8_t labelexpr[SCLASS_EXPR_MAX_SIZE]);
 // void matocsserv_replallowed_servers_matches_labelexpr(const uint8_t labelexpr[SCLASS_EXPR_MAX_SIZE],uint16_t *replallowed,uint16_t *allvalid);
