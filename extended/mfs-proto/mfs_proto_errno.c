@@ -1,0 +1,297 @@
+#include <linux/export.h>
+#include <linux/module.h>
+
+#include "mfs_proto.h"
+
+#ifndef ENODATA
+#define ENODATA ENOENT
+#endif
+
+#ifndef EOPNOTSUPP
+#define EOPNOTSUPP ENOTSUPP
+#endif
+
+static const char *const mfs_status_names[MFS_ERROR_MAX + 1] = {
+	[MFS_STATUS_OK] = "MFS_STATUS_OK",
+	[MFS_ERROR_EPERM] = "MFS_ERROR_EPERM",
+	[MFS_ERROR_ENOTDIR] = "MFS_ERROR_ENOTDIR",
+	[MFS_ERROR_ENOENT] = "MFS_ERROR_ENOENT",
+	[MFS_ERROR_EACCES] = "MFS_ERROR_EACCES",
+	[MFS_ERROR_EEXIST] = "MFS_ERROR_EEXIST",
+	[MFS_ERROR_EINVAL] = "MFS_ERROR_EINVAL",
+	[MFS_ERROR_ENOTEMPTY] = "MFS_ERROR_ENOTEMPTY",
+	[MFS_ERROR_CHUNKLOST] = "MFS_ERROR_CHUNKLOST",
+	[MFS_ERROR_OUTOFMEMORY] = "MFS_ERROR_OUTOFMEMORY",
+	[MFS_ERROR_INDEXTOOBIG] = "MFS_ERROR_INDEXTOOBIG",
+	[MFS_ERROR_LOCKED] = "MFS_ERROR_LOCKED",
+	[MFS_ERROR_NOCHUNKSERVERS] = "MFS_ERROR_NOCHUNKSERVERS",
+	[MFS_ERROR_NOCHUNK] = "MFS_ERROR_NOCHUNK",
+	[MFS_ERROR_CHUNKBUSY] = "MFS_ERROR_CHUNKBUSY",
+	[MFS_ERROR_REGISTER] = "MFS_ERROR_REGISTER",
+	[MFS_ERROR_NOTDONE] = "MFS_ERROR_NOTDONE",
+	[MFS_ERROR_NOTOPENED] = "MFS_ERROR_NOTOPENED",
+	[MFS_ERROR_NOTSTARTED] = "MFS_ERROR_NOTSTARTED",
+	[MFS_ERROR_WRONGVERSION] = "MFS_ERROR_WRONGVERSION",
+	[MFS_ERROR_CHUNKEXIST] = "MFS_ERROR_CHUNKEXIST",
+	[MFS_ERROR_NOSPACE] = "MFS_ERROR_NOSPACE",
+	[MFS_ERROR_IO] = "MFS_ERROR_IO",
+	[MFS_ERROR_BNUMTOOBIG] = "MFS_ERROR_BNUMTOOBIG",
+	[MFS_ERROR_WRONGSIZE] = "MFS_ERROR_WRONGSIZE",
+	[MFS_ERROR_WRONGOFFSET] = "MFS_ERROR_WRONGOFFSET",
+	[MFS_ERROR_CANTCONNECT] = "MFS_ERROR_CANTCONNECT",
+	[MFS_ERROR_WRONGCHUNKID] = "MFS_ERROR_WRONGCHUNKID",
+	[MFS_ERROR_DISCONNECTED] = "MFS_ERROR_DISCONNECTED",
+	[MFS_ERROR_CRC] = "MFS_ERROR_CRC",
+	[MFS_ERROR_DELAYED] = "MFS_ERROR_DELAYED",
+	[MFS_ERROR_CANTCREATEPATH] = "MFS_ERROR_CANTCREATEPATH",
+	[MFS_ERROR_MISMATCH] = "MFS_ERROR_MISMATCH",
+	[MFS_ERROR_EROFS] = "MFS_ERROR_EROFS",
+	[MFS_ERROR_QUOTA] = "MFS_ERROR_QUOTA",
+	[MFS_ERROR_BADSESSIONID] = "MFS_ERROR_BADSESSIONID",
+	[MFS_ERROR_NOPASSWORD] = "MFS_ERROR_NOPASSWORD",
+	[MFS_ERROR_BADPASSWORD] = "MFS_ERROR_BADPASSWORD",
+	[MFS_ERROR_ENOATTR] = "MFS_ERROR_ENOATTR",
+	[MFS_ERROR_ENOTSUP] = "MFS_ERROR_ENOTSUP",
+	[MFS_ERROR_ERANGE] = "MFS_ERROR_ERANGE",
+	[MFS_ERROR_NOTFOUND] = "MFS_ERROR_NOTFOUND",
+	[MFS_ERROR_ACTIVE] = "MFS_ERROR_ACTIVE",
+	[MFS_ERROR_CSNOTPRESENT] = "MFS_ERROR_CSNOTPRESENT",
+	[MFS_ERROR_WAITING] = "MFS_ERROR_WAITING",
+	[MFS_ERROR_EAGAIN] = "MFS_ERROR_EAGAIN",
+	[MFS_ERROR_EINTR] = "MFS_ERROR_EINTR",
+	[MFS_ERROR_ECANCELED] = "MFS_ERROR_ECANCELED",
+	[MFS_ERROR_ENOENT_NOCACHE] = "MFS_ERROR_ENOENT_NOCACHE",
+	[MFS_ERROR_EPERM_NOTADMIN] = "MFS_ERROR_EPERM_NOTADMIN",
+	[MFS_ERROR_CLASSEXISTS] = "MFS_ERROR_CLASSEXISTS",
+	[MFS_ERROR_CLASSLIMITREACH] = "MFS_ERROR_CLASSLIMITREACH",
+	[MFS_ERROR_NOSUCHCLASS] = "MFS_ERROR_NOSUCHCLASS",
+	[MFS_ERROR_CLASSINUSE] = "MFS_ERROR_CLASSINUSE",
+	[MFS_ERROR_INCOMPATVERSION] = "MFS_ERROR_INCOMPATVERSION",
+	[MFS_ERROR_PATTERNEXISTS] = "MFS_ERROR_PATTERNEXISTS",
+	[MFS_ERROR_PATLIMITREACHED] = "MFS_ERROR_PATLIMITREACHED",
+	[MFS_ERROR_NOSUCHPATTERN] = "MFS_ERROR_NOSUCHPATTERN",
+	[MFS_ERROR_ENAMETOOLONG] = "MFS_ERROR_ENAMETOOLONG",
+	[MFS_ERROR_EMLINK] = "MFS_ERROR_EMLINK",
+	[MFS_ERROR_ETIMEDOUT] = "MFS_ERROR_ETIMEDOUT",
+	[MFS_ERROR_EBADF] = "MFS_ERROR_EBADF",
+	[MFS_ERROR_EFBIG] = "MFS_ERROR_EFBIG",
+	[MFS_ERROR_EISDIR] = "MFS_ERROR_EISDIR",
+	[MFS_ERROR_MAX] = "MFS_ERROR_UNKNOWN",
+};
+
+static const char *const mfs_status_desc[MFS_ERROR_MAX + 1] = {
+	[MFS_STATUS_OK] = "OK",
+	[MFS_ERROR_EPERM] = "Operation not permitted",
+	[MFS_ERROR_ENOTDIR] = "Not a directory",
+	[MFS_ERROR_ENOENT] = "No such file or directory",
+	[MFS_ERROR_EACCES] = "Permission denied",
+	[MFS_ERROR_EEXIST] = "File exists",
+	[MFS_ERROR_EINVAL] = "Invalid argument",
+	[MFS_ERROR_ENOTEMPTY] = "Directory not empty",
+	[MFS_ERROR_CHUNKLOST] = "Chunk lost",
+	[MFS_ERROR_OUTOFMEMORY] = "Out of memory",
+	[MFS_ERROR_INDEXTOOBIG] = "Index too big",
+	[MFS_ERROR_LOCKED] = "Chunk locked",
+	[MFS_ERROR_NOCHUNKSERVERS] = "No chunk servers",
+	[MFS_ERROR_NOCHUNK] = "No such chunk",
+	[MFS_ERROR_CHUNKBUSY] = "Chunk is busy",
+	[MFS_ERROR_REGISTER] = "Incorrect register blob",
+	[MFS_ERROR_NOTDONE] = "Operation not completed",
+	[MFS_ERROR_NOTOPENED] = "File not opened",
+	[MFS_ERROR_NOTSTARTED] = "Write not started",
+	[MFS_ERROR_WRONGVERSION] = "Wrong chunk version",
+	[MFS_ERROR_CHUNKEXIST] = "Chunk already exists",
+	[MFS_ERROR_NOSPACE] = "No space left",
+	[MFS_ERROR_IO] = "I/O error",
+	[MFS_ERROR_BNUMTOOBIG] = "Incorrect block number",
+	[MFS_ERROR_WRONGSIZE] = "Incorrect size",
+	[MFS_ERROR_WRONGOFFSET] = "Incorrect offset",
+	[MFS_ERROR_CANTCONNECT] = "Cannot connect",
+	[MFS_ERROR_WRONGCHUNKID] = "Incorrect chunk id",
+	[MFS_ERROR_DISCONNECTED] = "Disconnected",
+	[MFS_ERROR_CRC] = "CRC error",
+	[MFS_ERROR_DELAYED] = "Operation delayed",
+	[MFS_ERROR_CANTCREATEPATH] = "Cannot create path",
+	[MFS_ERROR_MISMATCH] = "Data mismatch",
+	[MFS_ERROR_EROFS] = "Read-only filesystem",
+	[MFS_ERROR_QUOTA] = "Quota exceeded",
+	[MFS_ERROR_BADSESSIONID] = "Bad session id",
+	[MFS_ERROR_NOPASSWORD] = "Password required",
+	[MFS_ERROR_BADPASSWORD] = "Bad password",
+	[MFS_ERROR_ENOATTR] = "Attribute not found",
+	[MFS_ERROR_ENOTSUP] = "Operation not supported",
+	[MFS_ERROR_ERANGE] = "Result too large",
+	[MFS_ERROR_NOTFOUND] = "Entity not found",
+	[MFS_ERROR_ACTIVE] = "Entity is active",
+	[MFS_ERROR_CSNOTPRESENT] = "Chunkserver not present",
+	[MFS_ERROR_WAITING] = "Waiting on lock",
+	[MFS_ERROR_EAGAIN] = "Resource temporarily unavailable",
+	[MFS_ERROR_EINTR] = "Interrupted system call",
+	[MFS_ERROR_ECANCELED] = "Operation canceled",
+	[MFS_ERROR_ENOENT_NOCACHE] = "No such file (not cacheable)",
+	[MFS_ERROR_EPERM_NOTADMIN] = "Operation not permitted (admin only)",
+	[MFS_ERROR_CLASSEXISTS] = "Class already exists",
+	[MFS_ERROR_CLASSLIMITREACH] = "Class limit reached",
+	[MFS_ERROR_NOSUCHCLASS] = "No such class",
+	[MFS_ERROR_CLASSINUSE] = "Class in use",
+	[MFS_ERROR_INCOMPATVERSION] = "Incompatible version",
+	[MFS_ERROR_PATTERNEXISTS] = "Pattern exists",
+	[MFS_ERROR_PATLIMITREACHED] = "Pattern limit reached",
+	[MFS_ERROR_NOSUCHPATTERN] = "No such pattern",
+	[MFS_ERROR_ENAMETOOLONG] = "Name too long",
+	[MFS_ERROR_EMLINK] = "Too many links",
+	[MFS_ERROR_ETIMEDOUT] = "Timed out",
+	[MFS_ERROR_EBADF] = "Bad file descriptor",
+	[MFS_ERROR_EFBIG] = "File too large",
+	[MFS_ERROR_EISDIR] = "Is a directory",
+	[MFS_ERROR_MAX] = "Unknown MooseFS error",
+};
+
+int mfs_status_to_errno(s32 status)
+{
+	if (status <= 0)
+		return status;
+
+	switch (status) {
+	case MFS_STATUS_OK:
+		return 0;
+	case MFS_ERROR_EPERM:
+	case MFS_ERROR_EPERM_NOTADMIN:
+		return -EPERM;
+	case MFS_ERROR_ENOTDIR:
+		return -ENOTDIR;
+	case MFS_ERROR_ENOENT:
+	case MFS_ERROR_NOCHUNK:
+	case MFS_ERROR_NOTFOUND:
+	case MFS_ERROR_ENOENT_NOCACHE:
+	case MFS_ERROR_NOSUCHCLASS:
+	case MFS_ERROR_NOSUCHPATTERN:
+		return -ENOENT;
+	case MFS_ERROR_EACCES:
+	case MFS_ERROR_NOPASSWORD:
+	case MFS_ERROR_BADPASSWORD:
+		return -EACCES;
+	case MFS_ERROR_EEXIST:
+	case MFS_ERROR_CHUNKEXIST:
+	case MFS_ERROR_CLASSEXISTS:
+	case MFS_ERROR_PATTERNEXISTS:
+		return -EEXIST;
+	case MFS_ERROR_EINVAL:
+	case MFS_ERROR_WRONGCHUNKID:
+		return -EINVAL;
+	case MFS_ERROR_ENOTEMPTY:
+		return -ENOTEMPTY;
+	case MFS_ERROR_CHUNKLOST:
+	case MFS_ERROR_CSNOTPRESENT:
+		return -ENXIO;
+	case MFS_ERROR_OUTOFMEMORY:
+		return -ENOMEM;
+	case MFS_ERROR_INDEXTOOBIG:
+	case MFS_ERROR_BNUMTOOBIG:
+	case MFS_ERROR_WRONGSIZE:
+		return -EOVERFLOW;
+	case MFS_ERROR_LOCKED:
+	case MFS_ERROR_CHUNKBUSY:
+	case MFS_ERROR_ACTIVE:
+	case MFS_ERROR_CLASSINUSE:
+		return -EBUSY;
+	case MFS_ERROR_NOCHUNKSERVERS:
+	case MFS_ERROR_NOSPACE:
+	case MFS_ERROR_CLASSLIMITREACH:
+	case MFS_ERROR_PATLIMITREACHED:
+		return -ENOSPC;
+	case MFS_ERROR_REGISTER:
+	case MFS_ERROR_INCOMPATVERSION:
+		return -EPROTO;
+	case MFS_ERROR_NOTDONE:
+		return -EIO;
+	case MFS_ERROR_NOTOPENED:
+	case MFS_ERROR_EBADF:
+		return -EBADF;
+	case MFS_ERROR_NOTSTARTED:
+		return -EPIPE;
+	case MFS_ERROR_WRONGVERSION:
+		return -ESTALE;
+	case MFS_ERROR_IO:
+		return -EIO;
+	case MFS_ERROR_WRONGOFFSET:
+		return -ERANGE;
+	case MFS_ERROR_CANTCONNECT:
+	case MFS_ERROR_DISCONNECTED:
+		return -ENOTCONN;
+	case MFS_ERROR_CRC:
+	case MFS_ERROR_MISMATCH:
+		return -EILSEQ;
+	case MFS_ERROR_DELAYED:
+	case MFS_ERROR_WAITING:
+	case MFS_ERROR_EAGAIN:
+		return -EAGAIN;
+	case MFS_ERROR_CANTCREATEPATH:
+		return -ENOENT;
+	case MFS_ERROR_EROFS:
+		return -EROFS;
+	case MFS_ERROR_QUOTA:
+		return -EDQUOT;
+	case MFS_ERROR_BADSESSIONID:
+		return -EKEYEXPIRED;
+	case MFS_ERROR_ENOATTR:
+		return -ENODATA;
+	case MFS_ERROR_ENOTSUP:
+		return -EOPNOTSUPP;
+	case MFS_ERROR_ERANGE:
+		return -ERANGE;
+	case MFS_ERROR_EINTR:
+		return -EINTR;
+	case MFS_ERROR_ECANCELED:
+		return -ECANCELED;
+	case MFS_ERROR_ENAMETOOLONG:
+		return -ENAMETOOLONG;
+	case MFS_ERROR_EMLINK:
+		return -EMLINK;
+	case MFS_ERROR_ETIMEDOUT:
+		return -ETIMEDOUT;
+	case MFS_ERROR_EFBIG:
+		return -EFBIG;
+	case MFS_ERROR_EISDIR:
+		return -EISDIR;
+	default:
+		return -EIO;
+	}
+}
+EXPORT_SYMBOL_GPL(mfs_status_to_errno);
+
+const char *mfs_status_to_string(u8 status)
+{
+	if (status > MFS_ERROR_MAX)
+		status = MFS_ERROR_MAX;
+	if (!mfs_status_names[status])
+		return mfs_status_names[MFS_ERROR_MAX];
+	return mfs_status_names[status];
+}
+EXPORT_SYMBOL_GPL(mfs_status_to_string);
+
+const char *mfs_status_description(u8 status)
+{
+	if (status > MFS_ERROR_MAX)
+		status = MFS_ERROR_MAX;
+	if (!mfs_status_desc[status])
+		return mfs_status_desc[MFS_ERROR_MAX];
+	return mfs_status_desc[status];
+}
+EXPORT_SYMBOL_GPL(mfs_status_description);
+
+static int __init mfs_proto_init(void)
+{
+	return 0;
+}
+
+static void __exit mfs_proto_exit(void)
+{
+}
+
+module_init(mfs_proto_init);
+module_exit(mfs_proto_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("MooseFS kernel protocol library");
+MODULE_DESCRIPTION("Kernel-space MooseFS protocol encode/decode library");

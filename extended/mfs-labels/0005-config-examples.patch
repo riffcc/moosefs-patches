@@ -1,0 +1,72 @@
+From 23441faef67f5add0af0ee1162828c5e1118e696 Mon Sep 17 00:00:00 2001
+From: Benjamin Arntzen <zorlin@gmail.com>
+Date: Wed, 4 Mar 2026 22:05:28 +0000
+Subject: [PATCH] config: document per-disk labels and precedence examples
+
+---
+ mfsdata/mfschunkserver.cfg.in |  7 ++++++-
+ mfsdata/mfshdd.cfg            | 12 +++++++++++-
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/mfsdata/mfschunkserver.cfg.in b/mfsdata/mfschunkserver.cfg.in
+index 81f3178..753cf3b 100644
+--- a/mfsdata/mfschunkserver.cfg.in
++++ b/mfsdata/mfschunkserver.cfg.in
+@@ -105,6 +105,12 @@
+ # labels string (default is empty - no labels); labels should be defined as a set of letters (case insensitive) separated by ',' or ';'
+ # LABELS = 
+ 
++# controls precedence of per-disk labels from mfshdd.cfg over LABELS:
++# disk   - per-disk labels override LABELS for entries that define [labels=...] (default)
++# server - LABELS apply to all disks, ignore per-disk overrides
++# merge  - effective disk labels are union of LABELS and per-disk labels
++# LABEL_PRECEDENCE = disk
++
+ # local address to use for master connections (default is *, i.e. default local address)
+ # BIND_HOST = *
+ 
+@@ -135,4 +141,3 @@
+ 
+ # port to listen for client (mount) connections (default is @DEFAULT_CS_DATA_PORT@)
+ # CSSERV_LISTEN_PORT = @DEFAULT_CS_DATA_PORT@
+-
+diff --git a/mfsdata/mfshdd.cfg b/mfsdata/mfshdd.cfg
+index 6a6819d..5120591 100644
+--- a/mfsdata/mfshdd.cfg
++++ b/mfsdata/mfshdd.cfg
+@@ -2,7 +2,7 @@
+ # Each line defines one path. Lines starting with hash (#) are ignored.
+ # Line format:
+ #
+-#[PREFIX]PATH [SPACE OPTIONS]
++#[PREFIX]PATH [SPACE OPTIONS] [labels=A,B,C]
+ #
+ # A path may begin with optional PREFIX, which switches additional options:
+ # '*' means that this hard drive is 'marked for removal' and all data will be replicated to other hard drives (usually on other chunkservers)
+@@ -24,6 +24,10 @@
+ # If the percent or space are negative, then we define the unavailable amount of space instead.
+ # For a more detailed description of space limits and how total and available space are calculated when a space limit is used refer to mfshdd.cfg(5) man page.
+ #
++# Optional "labels=..." suffix can be used to define labels for a specific disk entry. Labels should be letters (A-Z, case insensitive) separated by ',' or ';'.
++# Examples:
++# [labels=A,B] [labels=c;d] [labels=]
++#
+ # Examples:
+ #
+ # use hard drive '/mnt/hdd' with default options:
+@@ -59,6 +63,12 @@
+ # use hard drive '/mnt/hdd', but treat it as a 'shared' drive, assume the total avail space on the device is smaller by 50GiB
+ #/mnt/hdd =-50GiB
+ #
++# use hard drive '/mnt/hdd' with per-disk labels A and B
++#/mnt/hdd [labels=A,B]
++#
++# use hard drive '/mnt/hdd', but try to leave 5GiB free and set per-disk labels C and D
++#/mnt/hdd -5GiB [labels=C,D]
++#
+ # use hard drive '/mnt/hdd', but fill it up using data from other drives
+ #>/mnt/hdd
+ #
+-- 
+2.50.1 (Apple Git-155)
+

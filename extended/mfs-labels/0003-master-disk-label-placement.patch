@@ -1,0 +1,287 @@
+From a3120369ac15cca7df8397e095d00ca1b6f9531a Mon Sep 17 00:00:00 2001
+From: Benjamin Arntzen <zorlin@gmail.com>
+Date: Wed, 4 Mar 2026 22:05:10 +0000
+Subject: [PATCH] mfsmaster: use per-disk labels for placement matching
+
+---
+ mfsmaster/chunks.c     |   4 +-
+ mfsmaster/csdb.c       |   6 +-
+ mfsmaster/matocsserv.c | 124 ++++++++++++++++++++++++++++++++++++++++-
+ mfsmaster/matocsserv.h |   1 +
+ 4 files changed, 127 insertions(+), 8 deletions(-)
+
+diff --git a/mfsmaster/chunks.c b/mfsmaster/chunks.c
+index 7eb321f..9656704 100644
+--- a/mfsmaster/chunks.c
++++ b/mfsmaster/chunks.c
+@@ -945,7 +945,7 @@ int32_t* do_advanced_match(const storagemode *sm,uint32_t servcnt,const uint16_t
+ 		} else if (sm->uniqmask & UNIQ_MASK_RACK) {
+ 			sid = topology_get_rackid(matocsserv_server_get_ip(cstab[servers[i]].ptr));
+ 		} else {
+-			sid = matocsserv_server_get_labelmask(cstab[servers[i]].ptr) & sm->uniqmask;
++			sid = matocsserv_server_get_effective_labelmask(cstab[servers[i]].ptr) & sm->uniqmask;
+ 		}
+ 		if (sid==0) {
+ 			group[i] = i;
+@@ -8264,7 +8264,7 @@ void chunk_do_jobs(chunk *c,uint8_t mode,uint32_t now,uint8_t extrajob) {
+ 									break;
+ 								}
+ 							} else if (sm->uniqmask) {
+-								if ((matocsserv_server_get_labelmask(cstab[servers[k]].ptr) & (sm->uniqmask)) == (matocsserv_server_get_labelmask(cstab[dcsids[j]].ptr) & (sm->uniqmask))) { // we have copy on server with the same uniq labels - can't use
++								if ((matocsserv_server_get_effective_labelmask(cstab[servers[k]].ptr) & (sm->uniqmask)) == (matocsserv_server_get_effective_labelmask(cstab[dcsids[j]].ptr) & (sm->uniqmask))) { // we have copy on server with the same uniq labels - can't use
+ 									break;
+ 								}
+ 							}
+diff --git a/mfsmaster/csdb.c b/mfsmaster/csdb.c
+index 72c4745..becd4c3 100644
+--- a/mfsmaster/csdb.c
++++ b/mfsmaster/csdb.c
+@@ -350,10 +350,10 @@ uint32_t csdb_servlist_data(uint8_t mode,uint8_t *ptr,uint32_t clientip) {
+ 				}
+ 				p = ptr;
+ 				if (csptr->eptr) {
+-					uint32_t version,chunkscount,tdchunkscount,errorcounter,load,labelmask;
++					uint32_t version,chunkscount,tdchunkscount,errorcounter,load,effectivelabelmask;
+ 					uint64_t usedspace,totalspace,tdusedspace,tdtotalspace;
+ 					uint8_t hlstatus,mfrstatus;
+-					matocsserv_getservdata(csptr->eptr,&version,&usedspace,&totalspace,&chunkscount,&tdusedspace,&tdtotalspace,&tdchunkscount,&errorcounter,&load,&hlstatus,&labelmask,&mfrstatus);
++					matocsserv_getservdata(csptr->eptr,&version,&usedspace,&totalspace,&chunkscount,&tdusedspace,&tdtotalspace,&tdchunkscount,&errorcounter,&load,&hlstatus,&effectivelabelmask,&mfrstatus);
+ 					if (hlstatus==HLSTATUS_OK) {
+ 						gracetime = 0;
+ 					} else if (hlstatus==HLSTATUS_OVERLOADED) {
+@@ -377,7 +377,7 @@ uint32_t csdb_servlist_data(uint8_t mode,uint8_t *ptr,uint32_t clientip) {
+ 					put32bit(&ptr,errorcounter);
+ 					put32bit(&ptr,load);
+ 					put32bit(&ptr,gracetime);
+-					put32bit(&ptr,labelmask);
++					put32bit(&ptr,effectivelabelmask);
+ 					put8bit(&ptr,mfrstatus);
+ 				} else {
+ 					put32bit(&ptr,0);
+diff --git a/mfsmaster/matocsserv.c b/mfsmaster/matocsserv.c
+index 427877b..2d3d0b4 100644
+--- a/mfsmaster/matocsserv.c
++++ b/mfsmaster/matocsserv.c
+@@ -116,6 +116,11 @@ typedef struct in_packetstruct {
+ 	uint8_t data[1];
+ } in_packetstruct;
+ 
++typedef struct disklabelentry {
++	char *path;
++	uint32_t labelmask;
++} disklabelentry;
++
+ typedef struct matocsserventry {
+ 	uint8_t mode;
+ 	int sock;
+@@ -151,6 +156,9 @@ typedef struct matocsserventry {
+ 
+ 	uint32_t labelmask;
+ 	char *labelstr;
++	uint32_t disklabelmask;
++	uint16_t disklabelscnt;
++	disklabelentry *disklabels;
+ 
+ 	uint32_t create_total_counter;
+ 	uint32_t rrep_total_counter;
+@@ -1082,6 +1090,15 @@ uint8_t matocsserv_server_matches_labelexpr(void *e,const uint8_t labelexpr[SCLA
+ 	matocsserventry *eptr = (matocsserventry*)e;
+ 
+ 	if (eptr!=NULL) {
++		uint16_t i;
++		if (eptr->disklabelscnt>0 && eptr->disklabels!=NULL) {
++			for (i=0 ; i<eptr->disklabelscnt ; i++) {
++				if (labelmask_matches_labelexpr(eptr->disklabels[i].labelmask,labelexpr)) {
++					return 1;
++				}
++			}
++			return 0;
++		}
+ 		return labelmask_matches_labelexpr(eptr->labelmask,labelexpr);
+ 	}
+ 	return 0;
+@@ -1107,7 +1124,7 @@ uint16_t matocsserv_servers_with_label(uint8_t label) {
+ 	cnt = 0;
+ 	for (eptr = matocsservhead ; eptr ; eptr=eptr->next) {
+ 		if (eptr->mode!=KILL && eptr->totalspace>0 && eptr->usedspace<=eptr->totalspace && eptr->csptr!=NULL) {
+-			if (eptr->labelmask & (1<<label)) {
++			if (matocsserv_server_get_effective_labelmask(eptr) & (1<<label)) {
+ 				cnt++;
+ 			}
+ 		}
+@@ -1120,6 +1137,11 @@ uint32_t matocsserv_server_get_labelmask(void *e) {
+ 	return eptr->labelmask;
+ }
+ 
++uint32_t matocsserv_server_get_effective_labelmask(void *e) {
++	matocsserventry *eptr = (matocsserventry *)e;
++	return (eptr->disklabelscnt>0)?(eptr->disklabelmask):(eptr->labelmask);
++}
++
+ const char* matocsserv_server_get_labelstr(void *e) {
+ 	matocsserventry *eptr = (matocsserventry *)e;
+ 	if (eptr->labelstr!=NULL) {
+@@ -1661,7 +1683,7 @@ int matocsserv_get_csdata(void *e,uint32_t clientip,uint32_t *servip,uint16_t *s
+ 			*servver = eptr->version;
+ 		}
+ 		if (servlabelmask!=NULL) {
+-			*servlabelmask = eptr->labelmask;
++			*servlabelmask = matocsserv_server_get_effective_labelmask(eptr);
+ 		}
+ 		return 0;
+ 	}
+@@ -1681,7 +1703,7 @@ void matocsserv_getservdata(void *e,uint32_t *ver,uint64_t *uspc,uint64_t *tspc,
+ 		*errcnt = eptr->errorcounter;
+ 		*load = eptr->load;
+ 		*hlstatus = eptr->hlstatus;
+-		*labelmask = eptr->labelmask;
++		*labelmask = matocsserv_server_get_effective_labelmask(eptr);
+ 		*mfrstatus = chunk_get_mfrstatus(eptr->csid);
+ 	} else {
+ 		*ver = 0;
+@@ -2738,6 +2760,20 @@ uint8_t matocsserv_csdb_force_disconnect(void *e,void *p) {
+ 	return 0;
+ }
+ 
++static void matocsserv_clear_disklabels(matocsserventry *eptr) {
++	uint16_t i;
++	if (eptr->disklabels) {
++		for (i=0 ; i<eptr->disklabelscnt ; i++) {
++			if (eptr->disklabels[i].path) {
++				free(eptr->disklabels[i].path);
++			}
++		}
++		free(eptr->disklabels);
++	}
++	eptr->disklabels = NULL;
++	eptr->disklabelscnt = 0;
++	eptr->disklabelmask = 0;
++}
+ 
+ void matocsserv_labels(matocsserventry *eptr,const uint8_t *data,uint32_t length) {
+ 	uint32_t i,l;
+@@ -2777,6 +2813,78 @@ void matocsserv_labels(matocsserventry *eptr,const uint8_t *data,uint32_t length
+ 	eptr->labelstr[l]=0;
+ }
+ 
++void matocsserv_disklabels(matocsserventry *eptr,const uint8_t *data,uint32_t length) {
++	uint16_t diskcnt,i;
++	uint16_t pathlen;
++	uint8_t *path;
++	disklabelentry *newlabels;
++
++	if (length<2) {
++		mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CSTOMA_DISK_LABELS - wrong size (%"PRIu32"/>=2)",length);
++		eptr->mode = KILL;
++		return;
++	}
++	passert(data);
++	diskcnt = get16bit(&data);
++	length -= 2;
++	{
++		const uint8_t *tptr;
++		uint32_t tleng;
++		tptr = data;
++		tleng = length;
++		for (i=0 ; i<diskcnt ; i++) {
++			if (tleng<2) {
++				mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CSTOMA_DISK_LABELS - wrong size (missing path length)");
++				eptr->mode = KILL;
++				return;
++			}
++			pathlen = get16bit(&tptr);
++			tleng -= 2;
++			if (tleng<pathlen+4) {
++				mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CSTOMA_DISK_LABELS - wrong size (truncated disk entry)");
++				eptr->mode = KILL;
++				return;
++			}
++			tptr += pathlen + 4;
++			tleng -= pathlen + 4;
++		}
++		if (tleng!=0) {
++			mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CSTOMA_DISK_LABELS - wrong size (trailing bytes: %"PRIu32")",tleng);
++			eptr->mode = KILL;
++			return;
++		}
++	}
++	if (diskcnt==0) {
++		matocsserv_clear_disklabels(eptr);
++		return;
++	}
++	newlabels = malloc(sizeof(disklabelentry)*(uint32_t)diskcnt);
++	passert(newlabels);
++	for (i=0 ; i<diskcnt ; i++) {
++		newlabels[i].path = NULL;
++		newlabels[i].labelmask = 0;
++	}
++	for (i=0 ; i<diskcnt ; i++) {
++		pathlen = get16bit(&data);
++		path = malloc((uint32_t)pathlen+1);
++		passert(path);
++		if (pathlen>0) {
++			memcpy(path,data,pathlen);
++			data += pathlen;
++		}
++		path[pathlen] = 0;
++		newlabels[i].path = (char*)path;
++		newlabels[i].labelmask = get32bit(&data);
++	}
++	matocsserv_clear_disklabels(eptr);
++	eptr->disklabels = newlabels;
++	eptr->disklabelscnt = diskcnt;
++	eptr->disklabelmask = 0;
++	for (i=0 ; i<diskcnt ; i++) {
++		eptr->disklabelmask |= newlabels[i].labelmask;
++	}
++}
++
+ void matocsserv_space(matocsserventry *eptr,const uint8_t *data,uint32_t length) {
+ 	if (length!=16 && length!=32 && length!=40) {
+ 		mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CSTOMA_SPACE - wrong size (%"PRIu32"/16|32|40)",length);
+@@ -3023,6 +3131,10 @@ void matocsserv_disconnection_finished(void *e) {
+ 	if (eptr->servdesc) {
+ 		free(eptr->servdesc);
+ 	}
++	if (eptr->labelstr) {
++		free(eptr->labelstr);
++	}
++	matocsserv_clear_disklabels(eptr);
+ 	free(eptr);
+ }
+ 
+@@ -3081,6 +3193,9 @@ void matocsserv_gotpacket(matocsserventry *eptr,uint32_t type,const uint8_t *dat
+ 		case CSTOMA_LABELS:
+ 			matocsserv_labels(eptr,data,length);
+ 			break;
++		case CSTOMA_DISK_LABELS:
++			matocsserv_disklabels(eptr,data,length);
++			break;
+ 		case CSTOAN_CHUNK_CHECKSUM:
+ 			matocsserv_got_chunk_checksum(eptr,data,length);
+ 			break;
+@@ -3481,6 +3596,9 @@ void matocsserv_serve(struct pollfd *pdesc) {
+ 
+ 			eptr->labelmask = 0;
+ 			eptr->labelstr = NULL;
++			eptr->disklabelmask = 0;
++			eptr->disklabelscnt = 0;
++			eptr->disklabels = NULL;
+ 
+ 			eptr->create_total_counter = 0;
+ 			eptr->rrep_total_counter = 0;
+diff --git a/mfsmaster/matocsserv.h b/mfsmaster/matocsserv.h
+index 278c7e5..ad7160a 100644
+--- a/mfsmaster/matocsserv.h
++++ b/mfsmaster/matocsserv.h
+@@ -80,6 +80,7 @@ enum {
+ 
+ uint8_t matocsserv_server_matches_labelexpr(void *e,const uint8_t labelexpr[SCLASS_EXPR_MAX_SIZE]);
+ uint32_t matocsserv_server_get_labelmask(void *e);
++uint32_t matocsserv_server_get_effective_labelmask(void *e);
+ uint32_t matocsserv_server_get_ip(void *e);
+ uint16_t matocsserv_servers_matches_labelexpr(const uint8_t labelexpr[SCLASS_EXPR_MAX_SIZE]);
+ // void matocsserv_replallowed_servers_matches_labelexpr(const uint8_t labelexpr[SCLASS_EXPR_MAX_SIZE],uint16_t *replallowed,uint16_t *allvalid);
+-- 
+2.50.1 (Apple Git-155)
+

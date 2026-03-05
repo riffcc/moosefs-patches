@@ -1,0 +1,87 @@
+# Build MooseFS from source with Extended MooseFS label patches
+FROM debian:trixie AS moosefs-build
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -qq && apt-get install -y -qq \
+    build-essential autoconf automake libtool \
+    libfuse3-dev fuse3 pkg-config \
+    zlib1g-dev libpcap-dev \
+    python3 git \
+    2>&1 | tail -10
+
+WORKDIR /build
+
+# Clone MooseFS source
+RUN git clone --depth 1 https://github.com/moosefs/moosefs.git mfs-src
+
+# Copy label patches and apply
+COPY patches/ /build/patches/
+RUN cd mfs-src && \
+    for p in /build/patches/*.patch; do \
+      [ -f "$p" ] && echo "Applying $(basename $p)" && git apply "$p" || echo "WARN: $p skipped"; \
+    done
+
+# Full build — all components
+RUN cd mfs-src && \
+    autoreconf -fi 2>&1 | tail -5 && \
+    ./configure --prefix=/usr/local \
+      --with-default-user=root \
+      --with-default-group=root \
+      --enable-mfsmaster \
+      --enable-mfsmetalogger \
+      --enable-mfschunkserver \
+      --enable-mfsmount \
+      --enable-mfstools \
+      2>&1 | tail -10 && \
+    make -j$(nproc) 2>&1 | tail -10 && \
+    make install 2>&1 | tail -5
+
+# Build mfscli inline script
+RUN cd mfs-src/mfsscripts && \
+    input_file="mfscli.py" && out_file="/usr/local/bin/mfscli" && \
+    : > "$out_file" && \
+    while IFS= read -r line; do \
+      case "$line" in \
+        from\ *\ import\ *\#\ MFS_INLINE_IMPORT) \
+          module=$(printf "%s" "$line" | sed -E "s/from (common\.[a-z_]+).*/\1/") && \
+          if test -n "$module"; then \
+            file_path=$(printf "%s.py" "$(echo "$module" | tr "." "/")") && \
+            if [ -f "$file_path" ]; then \
+              echo "### Imported inline from $file_path:" >> "$out_file" && \
+              grep -v "^from common" "$file_path" >> "$out_file" && \
+              echo "" >> "$out_file"; \
+            else \
+              printf "%s\n" "$line" >> "$out_file"; \
+            fi; \
+          else \
+            printf "%s\n" "$line" >> "$out_file"; \
+          fi ;; \
+        *) printf "%s\n" "$line" >> "$out_file" ;; \
+      esac; \
+    done < "$input_file" && \
+    chmod a+x /usr/local/bin/mfscli
+
+# --- Runtime image ---
+FROM debian:trixie-slim
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -qq && apt-get install -y -qq \
+    libfuse3-3 fuse3 python3 zlib1g libpcap0.8 \
+    bash procps net-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy all built MooseFS binaries + libs + configs
+COPY --from=moosefs-build /usr/local/ /usr/local/
+RUN ldconfig
+
+# Create default config dirs and data dirs
+RUN mkdir -p /etc/mfs /var/lib/mfs /mnt/mfs && \
+    cp /usr/local/etc/mfs/*.cfg.sample /etc/mfs/ 2>/dev/null || true && \
+    for f in /etc/mfs/*.cfg.sample; do \
+      target="${f%.sample}"; \
+      [ ! -f "$target" ] && cp "$f" "$target"; \
+    done 2>/dev/null || true
+
+WORKDIR /

@@ -1,0 +1,48 @@
+#!/bin/sh
+set -eu
+
+HELPER_BIN="${MFS_HELPER_BIN:-/usr/sbin/mfskmod-helper}"
+CTRL_DEV="${MFS_CTRL_DEV:-/dev/mfs_ctrl}"
+
+opts=""
+while getopts "o:" opt; do
+	case "$opt" in
+		o) opts="$OPTARG" ;;
+		*) ;;
+	esac
+done
+shift $((OPTIND-1))
+
+if [ "$#" -lt 2 ]; then
+	echo "usage: mount.mfs <source> <target> [-o opts]" >&2
+	exit 2
+fi
+
+source="$1"
+target="$2"
+
+if [ -z "$opts" ]; then
+	opts="master=$source"
+else
+	case ",$opts," in
+	*,master=*,*) ;;
+	*) opts="master=$source,$opts" ;;
+	esac
+fi
+
+if [ ! -c "$CTRL_DEV" ]; then
+	modprobe mfs >/dev/null 2>&1 || true
+	sleep 0.2
+fi
+
+if ! pgrep -f "[m]fskmod-helper.*-d $CTRL_DEV" >/dev/null 2>&1; then
+	if [ -x "$HELPER_BIN" ]; then
+		"$HELPER_BIN" -d "$CTRL_DEV" >/dev/null 2>&1 &
+		sleep 0.2
+	else
+		echo "mount.mfs: helper binary not found at $HELPER_BIN" >&2
+		exit 1
+	fi
+fi
+
+exec mount -i -t mfs -o "$opts" none "$target"

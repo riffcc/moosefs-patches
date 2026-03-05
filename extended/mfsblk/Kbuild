@@ -1,0 +1,11 @@
+obj-m += mfsblk.o
+
+mfsblk-y := \
+	mfsblk_main.o \
+	mfsblk_dev.o \
+	mfsblk_io.o \
+	mfsblk_conn.o \
+	mfsblk_proto.o \
+	mfsblk_cache.o
+
+ccflags-y += -Wall -Wextra

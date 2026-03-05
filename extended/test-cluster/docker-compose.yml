@@ -1,0 +1,331 @@
+###############################################################################
+# Extended MooseFS – Docker Test Cluster
+#
+# Spins up:
+#   - 1 MooseFS master          (mfsmaster)
+#   - 1 Metalogger              (mfsmetalogger)
+#   - 3 Chunkservers            (mfschunkserver1–3)
+#   - 1 FUSE client             (mfsclient)         – baseline / reference mount
+#   - 1 Builder container       (builder)            – compiles kernel modules
+#
+# Usage:
+#   cd extended/test-cluster
+#   docker compose up -d
+#   docker compose exec builder bash      # then run tests
+#   docker compose down -v                # teardown
+###############################################################################
+
+networks:
+  mfsnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.99.0/24
+
+volumes:
+  master-data:
+  meta-data:
+  cs1-data:
+  cs2-data:
+  cs3-data:
+  client-mount:
+  builder-workspace:
+
+services:
+  # ─── MooseFS Master ──────────────────────────────────────────────────
+  mfsmaster:
+    image: moosefs/master:latest
+    hostname: mfsmaster
+    container_name: mfs-master
+    networks:
+      mfsnet:
+        ipv4_address: 172.29.99.2
+    ports:
+      - "9419:9419"   # metalogger connections (MATOML)
+      - "9420:9420"   # chunkserver connections (MATOCS)
+      - "9421:9421"   # client connections (MATOCL)
+    volumes:
+      - master-data:/var/lib/mfs
+      - ./configs/mfsexports.cfg:/etc/mfs/mfsexports.cfg:ro
+    environment:
+      - MFS_ENV=TEST
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9421' 2>/dev/null || python3 -c 'import socket; s=socket.socket(); s.settimeout(2); s.connect((\"localhost\",9421)); s.close()' 2>/dev/null || mfscli -SIN -H localhost 2>/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+
+  # ─── Metalogger ──────────────────────────────────────────────────────
+  mfsmetalogger:
+    image: moosefs/metalogger:latest
+    hostname: mfsmetalogger
+    container_name: mfs-metalogger
+    networks:
+      mfsnet:
+        ipv4_address: 172.29.99.3
+    volumes:
+      - meta-data:/var/lib/mfs
+      - ./configs/mfsmetalogger.cfg:/etc/mfs/mfsmetalogger.cfg:ro
+    depends_on:
+      mfsmaster:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─── Chunkserver 1 ───────────────────────────────────────────────────
+  mfschunkserver1:
+    image: moosefs/chunkserver:latest
+    hostname: mfschunkserver1
+    container_name: mfs-cs1
+    networks:
+      mfsnet:
+        ipv4_address: 172.29.99.11
+    volumes:
+      - cs1-data:/mnt/cs1
+      - ./configs/mfschunkserver.cfg:/etc/mfs/mfschunkserver.cfg:ro
+      - ./configs/mfshdd-cs1.cfg:/etc/mfs/mfshdd.cfg:ro
+    depends_on:
+      mfsmaster:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        chown -R mfs:mfs /mnt/cs1 /var/lib/mfs
+        exec mfschunkserver -f
+    restart: unless-stopped
+
+  # ─── Chunkserver 2 ───────────────────────────────────────────────────
+  mfschunkserver2:
+    image: moosefs/chunkserver:latest
+    hostname: mfschunkserver2
+    container_name: mfs-cs2
+    networks:
+      mfsnet:
+        ipv4_address: 172.29.99.12
+    volumes:
+      - cs2-data:/mnt/cs2
+      - ./configs/mfschunkserver.cfg:/etc/mfs/mfschunkserver.cfg:ro
+      - ./configs/mfshdd-cs2.cfg:/etc/mfs/mfshdd.cfg:ro
+    depends_on:
+      mfsmaster:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        chown -R mfs:mfs /mnt/cs2 /var/lib/mfs
+        exec mfschunkserver -f
+    restart: unless-stopped
+
+  # ─── Chunkserver 3 ───────────────────────────────────────────────────
+  mfschunkserver3:
+    image: moosefs/chunkserver:latest
+    hostname: mfschunkserver3
+    container_name: mfs-cs3
+    networks:
+      mfsnet:
+        ipv4_address: 172.29.99.13
+    volumes:
+      - cs3-data:/mnt/cs3
+      - ./configs/mfschunkserver.cfg:/etc/mfs/mfschunkserver.cfg:ro
+      - ./configs/mfshdd-cs3.cfg:/etc/mfs/mfshdd.cfg:ro
+    depends_on:
+      mfsmaster:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        chown -R mfs:mfs /mnt/cs3 /var/lib/mfs
+        exec mfschunkserver -f
+    restart: unless-stopped
+
+  # ─── FUSE Client (baseline reference mount) ──────────────────────────
+  mfsclient:
+    image: moosefs/client:latest
+    hostname: mfsclient
+    container_name: mfs-client
+    networks:
+      mfsnet:
+        ipv4_address: 172.29.99.20
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - ./configs/mfsmount.cfg:/etc/mfs/mfsmount.cfg:ro
+    depends_on:
+      mfsmaster:
+        condition: service_healthy
+      mfschunkserver1:
+        condition: service_started
+      mfschunkserver2:
+        condition: service_started
+      mfschunkserver3:
+        condition: service_started
+    command: >
+      sh -c "
+        sleep 5 &&
+        mkdir -p /mnt/mfs &&
+        mfsmount /mnt/mfs -H mfsmaster -o nosuid,nodev &&
+        echo '=== MooseFS FUSE client mounted at /mnt/mfs ===' &&
+        tail -f /dev/null
+      "
+    restart: unless-stopped
+
+  # ─── Builder: compiles kernel modules + runs protocol tests ──────────
+  builder:
+    image: debian:trixie
+    hostname: mfs-builder
+    container_name: mfs-builder
+    networks:
+      mfsnet:
+        ipv4_address: 172.29.99.30
+    cap_add:
+      - SYS_ADMIN
+      - NET_RAW
+    privileged: true
+    devices:
+      - /dev/fuse:/dev/fuse
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      # Mount our generated source code
+      - ../mfs-proto:/workspace/mfs-proto
+      - ../mfs-kmod:/workspace/mfs-kmod
+      - ../mfsblk:/workspace/mfsblk
+      - ../qemu-mfs:/workspace/qemu-mfs
+      - ../mfs-labels:/workspace/mfs-labels:ro
+      # Persistent build workspace
+      - builder-workspace:/build
+      # Benchmark suite
+      - ./benches:/workspace/benches
+      # Test scripts
+      - ./scripts:/workspace/scripts:ro
+    depends_on:
+      mfsmaster:
+        condition: service_healthy
+      mfschunkserver1:
+        condition: service_started
+    environment:
+      - MFS_MASTER=172.29.99.2
+      - MFS_MASTER_PORT=9421
+      - MFS_CS1=172.29.99.11
+      - MFS_CS2=172.29.99.12
+      - MFS_CS3=172.29.99.13
+      - MFS_CS_PORT=9422
+      - DEBIAN_FRONTEND=noninteractive
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        echo '=== Installing core build dependencies ==='
+        apt-get update -qq
+        apt-get install -y -qq \
+          build-essential gcc make kmod \
+          autoconf automake libtool \
+          python3 python3-pip python3-venv \
+          netcat-openbsd tcpdump strace \
+          git wget curl xxd bc \
+          libfuse3-dev fuse3 pkg-config \
+          ninja-build meson \
+          libglib2.0-dev libpixman-1-dev \
+          flex bison \
+          fio \
+          libsqlite3-dev \
+          postgresql-client \
+          zlib1g-dev libpcap-dev \
+          protobuf-compiler \
+          2>&1 | tail -20
+        # Kernel headers — optional, needed only for kernel module builds
+        echo '=== Installing kernel headers (best-effort) ==='
+        ARCH=$$(dpkg --print-architecture)
+        apt-get install -y -qq linux-headers-$${ARCH} 2>&1 | tail -5 \
+          || echo "  WARN: linux-headers-$${ARCH} not available (ok for benchmarks)"
+        # Install latest Rust via rustup
+        echo '=== Installing latest Rust ==='
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable 2>&1 | tail -5
+        . "$$HOME/.cargo/env"
+        echo "  rustc: $$(rustc --version)"
+        # Build MooseFS tools from source (mfsmount + mfscli)
+        echo '=== Building MooseFS from source ==='
+        cd /build
+        if [ ! -d mfs-src ]; then
+          git clone --depth 1 https://github.com/moosefs/moosefs.git mfs-src 2>&1 | tail -5
+        fi
+        cd mfs-src
+        autoreconf -fi 2>&1 | tail -5
+        ./configure --prefix=/usr/local \
+          --with-default-user=root \
+          --with-default-group=root \
+          --disable-mfsmaster \
+          --disable-mfsmetalogger \
+          --disable-mfschunkserver \
+          --disable-mfscgi \
+          --disable-mfscgiserv \
+          --enable-mfsmount \
+          --enable-mfstools \
+          2>&1 | tail -10
+        make -j$$(nproc) 2>&1 | tail -10
+        make install 2>&1 | tail -5
+        echo "  mfsmount installed: $$(mfsmount --version 2>&1 | head -1 || echo 'built')"
+        # Build mfscli (Python script assembled by inlining common/ modules)
+        cd /build/mfs-src/mfsscripts
+        input_file="mfscli.py"; out_file="/usr/local/bin/mfscli"
+        : > "$$out_file"
+        while IFS= read -r line; do
+          case "$$line" in
+            from\ *\ import\ *\#\ MFS_INLINE_IMPORT)
+              module=$$(printf "%s" "$$line" | sed -E "s/from (common\\.[a-z_]+).*/\\1/")
+              if test -n "$$module"; then
+                file_path=$$(printf "%s.py" "$$(echo "$$module" | tr "." "/")")
+                if [ -f "$$file_path" ]; then
+                  echo "### Imported inline from $$file_path:" >> "$$out_file"
+                  grep -v "^from common" "$$file_path" >> "$$out_file"
+                  echo "" >> "$$out_file"
+                else
+                  printf "%s\n" "$$line" >> "$$out_file"
+                fi
+              else
+                printf "%s\n" "$$line" >> "$$out_file"
+              fi ;;
+            *) printf "%s\n" "$$line" >> "$$out_file" ;;
+          esac
+        done < "$$input_file"
+        chmod a+x /usr/local/bin/mfscli
+        echo "  mfscli installed: $$(mfscli --version 2>&1 | head -1 || echo 'built')"
+        # Build kernel modules (mfs_proto + mfs) — requires matching kernel headers
+        echo '=== Building kernel modules (best-effort) ==='
+        KVER=$$(uname -r)
+        if [ -d "/lib/modules/$${KVER}/build" ]; then
+          cd /workspace/mfs-proto && make -j$$(nproc) 2>&1 | tail -5 || echo '  WARN: mfs_proto build failed'
+          cd /workspace/mfs-kmod && make -j$$(nproc) 2>&1 | tail -5 || echo '  WARN: mfs-kmod build failed'
+          # Load + mount if build succeeded
+          if [ -f /workspace/mfs-proto/mfs_proto.ko ] && [ -f /workspace/mfs-kmod/mfs.ko ]; then
+            echo '=== Loading kernel modules ==='
+            insmod /workspace/mfs-proto/mfs_proto.ko 2>&1 && echo '  mfs_proto loaded' || echo '  WARN: mfs_proto load failed'
+            insmod /workspace/mfs-kmod/mfs.ko 2>&1 && echo '  mfs loaded' || echo '  WARN: mfs load failed'
+            install -m 0755 /workspace/mfs-kmod/mfskmod-helper /usr/sbin/mfskmod-helper 2>/dev/null || true
+            install -m 0755 /workspace/mfs-kmod/mount.mfs /sbin/mount.mfs 2>/dev/null || true
+          fi
+        else
+          echo "  SKIP: no kernel build dir for $${KVER} (Docker Desktop uses linuxkit — kernel modules need a real Linux host)"
+        fi
+        # Mount MooseFS — kernel native if available, FUSE fallback
+        echo '=== Mounting MooseFS ==='
+        mkdir -p /mnt/mfs
+        if [ -f /sbin/mount.mfs ]; then
+          mount -t mfs mfsmaster:9421 /mnt/mfs 2>&1 && echo '  Kernel client mounted at /mnt/mfs' \
+            || { echo '  Kernel mount failed, falling back to FUSE'; mfsmount /mnt/mfs -H mfsmaster -o nosuid,nodev 2>&1 || echo '  (FUSE mount also failed)'; }
+        else
+          mfsmount /mnt/mfs -H mfsmaster -o nosuid,nodev 2>&1 && echo '  FUSE client mounted at /mnt/mfs' \
+            || echo '  (mount deferred)'
+        fi
+        echo '=== Builder ready. Run: docker compose exec builder bash ==='
+        tail -f /dev/null
+    restart: unless-stopped

@@ -1,0 +1,220 @@
+From 4eca6055955534a350a13b2b237ddb82b1bac53f Mon Sep 17 00:00:00 2001
+From: Benjamin Arntzen <zorlin@gmail.com>
+Date: Wed, 4 Mar 2026 22:02:23 +0000
+Subject: [PATCH] chunkserver: report per-disk labels to master
+
+---
+ mfschunkserver/hddspacemgr.c | 74 ++++++++++++++++++++++++++++++++++++
+ mfschunkserver/hddspacemgr.h |  8 ++++
+ mfschunkserver/masterconn.c  | 20 ++++++++++
+ mfscommon/MFSCommunication.h |  3 ++
+ 4 files changed, 105 insertions(+)
+
+diff --git a/mfschunkserver/hddspacemgr.c b/mfschunkserver/hddspacemgr.c
+index aaa475e..143770a 100644
+--- a/mfschunkserver/hddspacemgr.c
++++ b/mfschunkserver/hddspacemgr.c
+@@ -463,6 +463,7 @@ static uint32_t errorcounter = 0;
+ static uint8_t hddspacechanged = 0;
+ static uint8_t hddspacerecalc = 0;
+ static uint8_t global_rebalance_is_on = 0;
++static uint8_t disklabelschanged = 0;
+ 
+ static pthread_t hsrebalancethread,rebalancethread,foldersthread,delayedthread,testerthread,knowndiskusagethread;
+ static uint8_t term = 0;
+@@ -1035,6 +1036,19 @@ static inline void hdd_stats_datafsync(folder *f,int64_t fsynctime) {
+ 	zassert(pthread_mutex_unlock(&statslock));
+ }
+ 
++static inline uint32_t hdd_effective_disklabelmask(folder *f,uint32_t serverlabelmask,uint8_t labelprecedence) {
++	if (labelprecedence==HDD_LABEL_PRECEDENCE_SERVER) {
++		return serverlabelmask;
++	}
++	if (labelprecedence==HDD_LABEL_PRECEDENCE_MERGE) {
++		return serverlabelmask | ((f->hasdisklabelmask)?(f->disklabelmask):0);
++	}
++	if (f->hasdisklabelmask) {
++		return f->disklabelmask;
++	}
++	return serverlabelmask;
++}
++
+ uint8_t hdd_sendingchunks(void) {
+ 	folder *f;
+ 	uint8_t result;
+@@ -1241,6 +1255,65 @@ void hdd_diskinfo_monotonic_data(uint8_t *buff) {
+ 	zassert(pthread_mutex_unlock(&folderlock));
+ }
+ 
++uint32_t hdd_disklabels_size(uint32_t serverlabelmask,uint8_t labelprecedence) {
++	folder *f;
++	uint32_t size,pathlen;
++
++	(void)serverlabelmask;
++	(void)labelprecedence;
++	size = 2;
++	zassert(pthread_mutex_lock(&folderlock));
++	for (f=folderhead ; f ; f=f->next) {
++		if (f->toremove==REMOVING_NO && f->damaged==0) {
++			pathlen = strlen(f->path);
++			if (pathlen>65535) {
++				pathlen = 65535;
++			}
++			size += 2 + pathlen + 4;
++		}
++	}
++	return size;
++}
++
++void hdd_disklabels_data(uint8_t *buff,uint32_t serverlabelmask,uint8_t labelprecedence) {
++	folder *f;
++	uint32_t pathlen,cnt;
++
++	cnt = 0;
++	for (f=folderhead ; f ; f=f->next) {
++		if (f->toremove==REMOVING_NO && f->damaged==0) {
++			cnt++;
++		}
++	}
++	if (cnt>65535) {
++		cnt = 65535;
++	}
++	put16bit(&buff,cnt);
++	for (f=folderhead ; f && cnt>0 ; f=f->next) {
++		if (f->toremove==REMOVING_NO && f->damaged==0) {
++			pathlen = strlen(f->path);
++			if (pathlen>65535) {
++				pathlen = 65535;
++			}
++			put16bit(&buff,pathlen);
++			memcpy(buff,f->path,pathlen);
++			buff += pathlen;
++			put32bit(&buff,hdd_effective_disklabelmask(f,serverlabelmask,labelprecedence));
++			cnt--;
++		}
++	}
++	zassert(pthread_mutex_unlock(&folderlock));
++}
++
++uint8_t hdd_disklabels_changed(void) {
++	uint8_t r;
++	zassert(pthread_mutex_lock(&folderlock));
++	r = disklabelschanged;
++	disklabelschanged = 0;
++	zassert(pthread_mutex_unlock(&folderlock));
++	return r;
++}
++
+ #define OF_BEFORE_OPEN 0
+ #define OF_AFTER_CLOSE 1
+ #define OF_INIT 2
+@@ -9075,6 +9148,7 @@ int hdd_folders_reinit(void) {
+ 			mfs_log(MFSLOG_SYSLOG,MFSLOG_INFO,"hdd space manager: folder %s will be removed",f->path);
+ 		}
+ 	}
++	disklabelschanged = 1;
+ 	folderactions = 1; // continue folder actions
+ 	zassert(pthread_mutex_unlock(&folderlock));
+ 
+diff --git a/mfschunkserver/hddspacemgr.h b/mfschunkserver/hddspacemgr.h
+index d03f108..2dac6cc 100644
+--- a/mfschunkserver/hddspacemgr.h
++++ b/mfschunkserver/hddspacemgr.h
+@@ -56,6 +56,14 @@ uint32_t hdd_diskinfo_size(void);
+ void hdd_diskinfo_data(uint8_t *buff);
+ uint32_t hdd_diskinfo_monotonic_size(void);
+ void hdd_diskinfo_monotonic_data(uint8_t *buff);
++
++#define HDD_LABEL_PRECEDENCE_DISK 0
++#define HDD_LABEL_PRECEDENCE_SERVER 1
++#define HDD_LABEL_PRECEDENCE_MERGE 2
++uint32_t hdd_disklabels_size(uint32_t serverlabelmask,uint8_t labelprecedence);
++void hdd_disklabels_data(uint8_t *buff,uint32_t serverlabelmask,uint8_t labelprecedence);
++uint8_t hdd_disklabels_changed(void);
++
+ /* lock/unlock pair */
+ void hdd_get_chunks_begin(uint8_t partialmode);
+ void hdd_get_chunks_end(void);
+diff --git a/mfschunkserver/masterconn.c b/mfschunkserver/masterconn.c
+index 05278a0..9cfdf1a 100644
+--- a/mfschunkserver/masterconn.c
++++ b/mfschunkserver/masterconn.c
+@@ -71,6 +71,8 @@
+ // force disconnection X seconds after term signal
+ #define FORCE_DISCONNECTION_TO 5.0
+ 
++#define DISK_LABELS_MIN_MASTER_VERSION VERSION2INT(4,59,0)
++
+ #define MYSIZE(s,f,a) ((offsetof(s,f)+(a)<sizeof(s))?sizeof(s):(offsetof(s,f)+(a)))
+ 
+ // mode
+@@ -153,6 +155,7 @@ static uint16_t ChunkServerID = 0;
+ static uint64_t MetaID = 0;
+ static char *AuthCode = NULL;
+ static uint32_t LabelMask = 0;
++static uint8_t LabelPrecedence = HDD_LABEL_PRECEDENCE_DISK;
+ 
+ static uint64_t hddmetaid;
+ 
+@@ -384,6 +387,18 @@ void masterconn_sendlabels(masterconn *eptr) {
+ 	put32bit(&buff,LabelMask);
+ }
+ 
++void masterconn_senddisklabels(masterconn *eptr) {
++	uint8_t *buff;
++	uint32_t size;
++
++	if (eptr->masterversion<DISK_LABELS_MIN_MASTER_VERSION) {
++		return;
++	}
++	size = hdd_disklabels_size(LabelMask,LabelPrecedence);
++	buff = masterconn_create_attached_packet(eptr,CSTOMA_DISK_LABELS,size);
++	hdd_disklabels_data(buff,LabelMask,LabelPrecedence);
++}
++
+ void masterconn_sendregister(masterconn *eptr) {
+ 	uint8_t *buff;
+ 	uint32_t myip;
+@@ -507,6 +522,7 @@ void masterconn_master_ack(masterconn *eptr,const uint8_t *data,uint32_t length)
+ 				eptr->registerstate = INPROGRESS;
+ 				if (eptr->masterversion>=VERSION2INT(2,1,0)) {
+ 					masterconn_sendlabels(eptr);
++					masterconn_senddisklabels(eptr);
+ 				}
+ 			}
+ 			if (eptr->registerstate == INPROGRESS) {
+@@ -688,6 +704,9 @@ void masterconn_check_hdd_reports(void) {
+ 		reconnectisneeded = 0;
+ 	}
+ 	if (eptr->registerstate==REGISTERED && eptr->mode==DATA) {
++		if (hdd_disklabels_changed()) {
++			masterconn_senddisklabels(eptr);
++		}
+ 		errorcounter = hdd_errorcounter();
+ 		while (errorcounter) {
+ 			masterconn_create_attached_packet(eptr,CSTOMA_ERROR_OCCURRED,0);
+@@ -2056,6 +2075,7 @@ void masterconn_reload(void) {
+ 		if (reconnectisneeded==0) { // we don't want to restart connection
+ 			if (eptr && eptr->mode==DATA && eptr->registerstate==REGISTERED) {
+ 				masterconn_sendlabels(eptr);
++				masterconn_senddisklabels(eptr);
+ 			} else {
+ 				reconnectisneeded = 1;
+ 			}
+diff --git a/mfscommon/MFSCommunication.h b/mfscommon/MFSCommunication.h
+index e1b93c8..d72cc56 100644
+--- a/mfscommon/MFSCommunication.h
++++ b/mfscommon/MFSCommunication.h
+@@ -1037,6 +1037,9 @@
+ #define CSTOMA_CHUNK_NEW (PROTO_BASE+107)
+ // N * [ chunkid:64 version:32 ]
+ 
++// 0x006C
++#define CSTOMA_DISK_LABELS (PROTO_BASE+108)
++// diskcnt:16 diskcnt * [ pathlen:16 path:8[pathlen] labelmask:32 ]
+ 
+ // 0x006D
+ #define CSTOMA_LABELS (PROTO_BASE+109)
+-- 
+2.50.1 (Apple Git-155)
+

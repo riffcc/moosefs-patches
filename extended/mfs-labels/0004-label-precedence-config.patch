@@ -1,0 +1,112 @@
+From 2e8fd55304a177e375bd36d620c1d3d91565b09f Mon Sep 17 00:00:00 2001
+From: Benjamin Arntzen <zorlin@gmail.com>
+Date: Wed, 4 Mar 2026 22:05:21 +0000
+Subject: [PATCH] chunkserver: add LABEL_PRECEDENCE configuration
+
+---
+ mfschunkserver/masterconn.c      | 53 ++++++++++++++++++++++++++++++++
+ mfsmanpages/mfschunkserver.cfg.5 |  3 ++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/mfschunkserver/masterconn.c b/mfschunkserver/masterconn.c
+index 9cfdf1a..1cf1e01 100644
+--- a/mfschunkserver/masterconn.c
++++ b/mfschunkserver/masterconn.c
+@@ -380,6 +380,49 @@ uint8_t masterconn_parselabels(void) {
+ 	return 0;
+ }
+ 
++static uint8_t masterconn_strieq(const char *a,const char *b) {
++	while (*a && *b) {
++		uint8_t ca,cb;
++		ca = (uint8_t)(*a);
++		cb = (uint8_t)(*b);
++		if (ca>='A' && ca<='Z') {
++			ca += ('a'-'A');
++		}
++		if (cb>='A' && cb<='Z') {
++			cb += ('a'-'A');
++		}
++		if (ca!=cb) {
++			return 0;
++		}
++		a++;
++		b++;
++	}
++	return (*a=='\0' && *b=='\0')?1:0;
++}
++
++uint8_t masterconn_parselabelprecedence(void) {
++	char *precedencestr;
++	uint8_t newprecedence;
++
++	precedencestr = cfg_getstr("LABEL_PRECEDENCE","disk");
++	newprecedence = HDD_LABEL_PRECEDENCE_DISK;
++	if (masterconn_strieq(precedencestr,"disk")) {
++		newprecedence = HDD_LABEL_PRECEDENCE_DISK;
++	} else if (masterconn_strieq(precedencestr,"server")) {
++		newprecedence = HDD_LABEL_PRECEDENCE_SERVER;
++	} else if (masterconn_strieq(precedencestr,"merge")) {
++		newprecedence = HDD_LABEL_PRECEDENCE_MERGE;
++	} else {
++		mfs_log(MFSLOG_SYSLOG_STDERR,MFSLOG_WARNING,"LABEL_PRECEDENCE: unknown value '%s' (allowed: disk,server,merge); using default: disk",precedencestr);
++	}
++	free(precedencestr);
++	if (newprecedence!=LabelPrecedence) {
++		LabelPrecedence = newprecedence;
++		return 1;
++	}
++	return 0;
++}
++
+ void masterconn_sendlabels(masterconn *eptr) {
+ 	uint8_t *buff;
+ 
+@@ -2001,6 +2044,7 @@ void masterconn_term(void) {
+ void masterconn_reload(void) {
+ 	masterconn *eptr = masterconnsingleton;
+ 	uint32_t ReconnectionDelay;
++	uint8_t precedencechanged;
+ 	char *newAuthCode;
+ 	char *newMasterHost;
+ 	char *newMasterPort;
+@@ -2081,6 +2125,14 @@ void masterconn_reload(void) {
+ 			}
+ 		}
+ 	}
++	precedencechanged = masterconn_parselabelprecedence();
++	if (precedencechanged && reconnectisneeded==0) {
++		if (eptr && eptr->mode==DATA && eptr->registerstate==REGISTERED) {
++			masterconn_senddisklabels(eptr);
++		} else {
++			reconnectisneeded = 1;
++		}
++	}
+ }
+ 
+ void masterconn_wantexit(void) {
+@@ -2127,6 +2179,7 @@ int masterconn_init(void) {
+ 		Timeout=10;
+ 	}
+ 	masterconn_parselabels();
++	masterconn_parselabelprecedence();
+ 	eptr = masterconnsingleton = malloc(sizeof(masterconn));
+ 	passert(eptr);
+ 
+diff --git a/mfsmanpages/mfschunkserver.cfg.5 b/mfsmanpages/mfschunkserver.cfg.5
+index 7ab4e3b..241acbe 100644
+--- a/mfsmanpages/mfschunkserver.cfg.5
++++ b/mfsmanpages/mfschunkserver.cfg.5
+@@ -102,6 +102,9 @@ Changes in this section require only process reload.
+ .B LABELS
+ labels string defined as a set of letters (case insensitive) separated by coma or semicolon; default is empty - no labels
+ .TP
++.B LABEL_PRECEDENCE
++controls how per-disk labels from \fBmfshdd.cfg\fP are combined with chunkserver-level \fBLABELS\fP: \fBdisk\fP (default) means per-disk labels override server labels for entries that define labels, \fBserver\fP means server labels are used for every disk, \fBmerge\fP means union of both sets for each disk
++.TP
+ .B BIND_HOST
+ local address to use for master connections; default is *, i.e. default local address
+ .TP
+-- 
+2.50.1 (Apple Git-155)
+

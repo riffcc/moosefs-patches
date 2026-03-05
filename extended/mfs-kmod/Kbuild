@@ -1,0 +1,14 @@
+obj-m += mfs.o
+
+mfs-y := \
+	mfs_super.o \
+	mfs_inode.o \
+	mfs_file.o \
+	mfs_dir.o \
+	mfs_symlink.o \
+	mfs_xattr.o \
+	mfs_helper_comm.o \
+	mfs_proto.o \
+	mfs_cache.o
+
+ccflags-y += -Wall -Wextra -Wno-unused-parameter

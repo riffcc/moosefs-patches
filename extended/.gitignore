@@ -1,0 +1,23 @@
+# Rust build artifacts
+target/
+*.d
+
+# Kernel module build artifacts
+*.o
+*.ko
+*.ko.cmd
+*.mod
+*.mod.c
+*.mod.cmd
+*.order
+*.symvers
+.tmp_versions/
+modules.order
+Module.symvers
+.*.cmd
+
+# General
+*.swp
+*.swo
+*~
+.DS_Store
