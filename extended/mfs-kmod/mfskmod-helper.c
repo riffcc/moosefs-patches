@@ -52,6 +52,7 @@
 #define HELPER_READ_REPLICA_LOOKAHEAD 4U
 #define HELPER_READ_STREAM_BAND_SHIFT 28
 #define HELPER_READ_STRIPE_META_MAX 16
+#define HELPER_READ_STRIPE_FILL_CREDITS 4U
 #define HELPER_READ_PREFETCH_WORKERS 1
 #define HELPER_READ_PREFETCH_QUEUE_MAX 2
 #define HELPER_READ_PREFETCH_DATA_CACHE_MAX 2
@@ -3416,6 +3417,8 @@ static void read_state_prepare_stripe(struct read_state *rs,
 	rs->stripe_band = band;
 	rs->stripe_base_chunk = base;
 	rs->stripe_chunk_count = chunks_per_band;
+	vlog("read_stripe: inode=%u band=%llu base_chunk=%u chunk_count=%u focus_chunk=%u",
+	     inode, (unsigned long long)band, base, chunks_per_band, chunk_idx);
 }
 
 static struct read_stripe_meta_entry *read_state_stripe_slot(struct read_state *rs,
@@ -3514,10 +3517,20 @@ static void read_state_fill_stripe_plan(struct helper_session *s,
 					uint32_t chunk_idx)
 {
 	struct chunk_meta meta;
+	uint32_t first_slot;
+	uint32_t max_slot;
 	uint32_t i;
 
 	read_state_prepare_stripe(rs, inode, chunk_idx);
-	for (i = 0; i < rs->stripe_chunk_count && i < HELPER_READ_STRIPE_META_MAX; i++) {
+	if (chunk_idx < rs->stripe_base_chunk)
+		return;
+	first_slot = chunk_idx - rs->stripe_base_chunk;
+	max_slot = first_slot + HELPER_READ_STRIPE_FILL_CREDITS;
+	if (max_slot > rs->stripe_chunk_count)
+		max_slot = rs->stripe_chunk_count;
+	if (max_slot > HELPER_READ_STRIPE_META_MAX)
+		max_slot = HELPER_READ_STRIPE_META_MAX;
+	for (i = first_slot; i < max_slot; i++) {
 		uint32_t stripe_chunk_idx = rs->stripe_base_chunk + i;
 		struct read_stripe_meta_entry *ent = &rs->stripe_meta[i];
 
@@ -4595,6 +4608,10 @@ static int read_state_read_data(struct helper_session *s,
 		pthread_cond_broadcast(&s->read_prefetch_cv);
 		pthread_mutex_unlock(&s->read_prefetch_mu);
 		if (ret) {
+			vlog("read_data: fetch failed inode=%u band=%llu chunk=%u off=%u fetch_len=%u ret=%d active_reads=%u",
+			     req->inode,
+			     (unsigned long long)mfs_read_band(req->offset),
+			     chunk_idx, fetch_off, fetch_len, ret, active_reads);
 			goto out;
 		}
 		if (got == 0) {
@@ -5201,7 +5218,8 @@ static void *read_worker_thread_main(void *arg)
 				if (!s->read_jobs[i].valid)
 					continue;
 				if (s->read_jobs[i].preferred_worker != worker_id) {
-					if (fallback_idx < 0)
+					if (fallback_idx < 0 &&
+					    s->read_jobs[i].preferred_worker >= HELPER_READ_WORKERS)
 						fallback_idx = (ssize_t)i;
 					continue;
 				}
