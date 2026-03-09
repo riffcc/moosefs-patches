@@ -39,7 +39,7 @@
 #define HELPER_READ_META_CACHE_MAX 64
 #define HELPER_READ_AFFINITY_CACHE_MAX 64
 #define HELPER_READ_FOREGROUND_MAX (4U * 1024U * 1024U)
-#define HELPER_READ_WORKERS 2
+#define HELPER_READ_WORKERS 1
 #define HELPER_READ_JOB_QUEUE_MAX 32
 #define HELPER_READ_REPLICA_LOOKAHEAD 4U
 #define HELPER_READ_PREFETCH_WORKERS 1
@@ -228,6 +228,7 @@ static int cs_read_data(const struct chunk_meta *m, uint32_t chunk_off,
 			uint32_t want, uint8_t *dst, uint32_t *got);
 static int cs_send_packet(int fd, uint32_t type, const void *data, uint32_t len);
 static void read_state_init(struct read_state *rs);
+static void read_state_drop_cs(struct read_state *rs);
 static void read_state_reset_scoreboard(struct read_state *rs);
 static void read_state_reset_prefetch(struct read_state *rs);
 static void read_state_destroy(struct read_state *rs);
@@ -287,6 +288,16 @@ static void read_state_reset_scoreboard(struct read_state *rs)
 	memset(rs->scoreboard, 0, sizeof(rs->scoreboard));
 }
 
+static void read_state_drop_cs(struct read_state *rs)
+{
+	if (rs->cs_fd >= 0) {
+		close(rs->cs_fd);
+		rs->cs_fd = -1;
+	}
+	rs->cs_ip = 0;
+	rs->cs_port = 0;
+}
+
 static void read_state_reset_prefetch(struct read_state *rs)
 {
 	rs->prefetch_len = HELPER_READ_PREFETCH_BASE;
@@ -296,10 +307,7 @@ static void read_state_reset_prefetch(struct read_state *rs)
 
 static void read_state_destroy(struct read_state *rs)
 {
-	if (rs->cs_fd >= 0) {
-		close(rs->cs_fd);
-		rs->cs_fd = -1;
-	}
+	read_state_drop_cs(rs);
 	read_state_reset_scoreboard(rs);
 	read_state_reset_prefetch(rs);
 	rs->meta_valid = false;
@@ -307,8 +315,6 @@ static void read_state_destroy(struct read_state *rs)
 	rs->inode = 0;
 	rs->chunk_idx = 0;
 	memset(&rs->meta, 0, sizeof(rs->meta));
-	rs->cs_ip = 0;
-	rs->cs_port = 0;
 	rs->preferred_ip = 0;
 	rs->preferred_port = 0;
 }
@@ -555,6 +561,13 @@ static bool session_try_use_prefetched_read(struct helper_session *s,
 					    uint32_t inode, uint32_t chunk_idx,
 					    uint32_t chunk_off, uint32_t want)
 {
+	(void)s;
+	(void)inode;
+	(void)chunk_idx;
+	(void)chunk_off;
+	(void)want;
+	return false;
+#if 0
 	struct read_prefetch_data_entry *best = NULL;
 	uint8_t *tmp = NULL;
 	uint32_t base = 0;
@@ -598,12 +611,18 @@ static bool session_try_use_prefetched_read(struct helper_session *s,
 	free(tmp);
 	session_commit_read_window(s, base, len);
 	return true;
+#endif
 }
 
 static void session_schedule_read_ahead(struct helper_session *s,
 					uint32_t inode,
 					uint32_t chunk_idx)
 {
+	(void)s;
+	(void)inode;
+	(void)chunk_idx;
+	return;
+#if 0
 	uint32_t len = s->read_prefetch_len;
 	uint32_t i;
 
@@ -611,6 +630,7 @@ static void session_schedule_read_ahead(struct helper_session *s,
 		len = HELPER_READ_PREFETCH_WORKER_MAX;
 	for (i = 0; i < HELPER_READ_REPLICA_LOOKAHEAD; i++)
 		session_schedule_read_meta_prefetch(s, inode, chunk_idx + i, 0, len);
+#endif
 }
 
 static const struct cs_loc *choose_read_replica(struct helper_session *s,
@@ -2980,12 +3000,7 @@ static void read_state_invalidate(struct read_state *rs)
 	rs->inode = 0;
 	rs->chunk_idx = 0;
 	memset(&rs->meta, 0, sizeof(rs->meta));
-	if (rs->cs_fd >= 0) {
-		close(rs->cs_fd);
-		rs->cs_fd = -1;
-	}
-	rs->cs_ip = 0;
-	rs->cs_port = 0;
+	read_state_drop_cs(rs);
 	read_state_reset_scoreboard(rs);
 	read_state_reset_prefetch(rs);
 }
@@ -3540,7 +3555,7 @@ static int read_state_fetch_window(struct helper_session *s,
 		} else {
 			ret = csfd;
 		}
-		read_state_invalidate(rs);
+		read_state_drop_cs(rs);
 	}
 
 	for (i = 0; i < m->loc_count; i++) {
@@ -3560,7 +3575,7 @@ static int read_state_fetch_window(struct helper_session *s,
 					 fetch_buf, got_out);
 		if (ret == 0)
 			return 0;
-		read_state_invalidate(rs);
+		read_state_drop_cs(rs);
 	}
 
 	return ret;
