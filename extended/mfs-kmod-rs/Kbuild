@@ -1,0 +1,2 @@
+# Rust out-of-tree module: mfs_rs.rs -> mfs_rs.ko
+obj-m := mfs_rs.o

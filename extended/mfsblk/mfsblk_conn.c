@@ -1,3 +1,4 @@
+#include <crypto/hash.h>
 #include <linux/crc32.h>
 #include <linux/errno.h>
 #include <linux/in.h>
@@ -23,6 +24,54 @@
 #endif
 
 #include "mfsblk.h"
+
+static int mfsblk_md5_buffer(const u8 *data, size_t len, u8 *digest)
+{
+	struct crypto_shash *tfm;
+	struct shash_desc *desc;
+	int ret;
+
+	tfm = crypto_alloc_shash("md5", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+
+	desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_NOIO);
+	if (!desc) {
+		crypto_free_shash(tfm);
+		return -ENOMEM;
+	}
+	desc->tfm = tfm;
+	ret = crypto_shash_digest(desc, data, len, digest);
+	kfree(desc);
+	crypto_free_shash(tfm);
+	return ret;
+}
+
+static int mfsblk_md5_password_digest(const char *password, const u8 challenge[32],
+				      u8 digest[16])
+{
+	u8 passdigest[16];
+	u8 material[48];
+	int ret;
+
+	ret = mfsblk_md5_buffer((const u8 *)password, strlen(password), passdigest);
+	if (ret)
+		return ret;
+
+	memcpy(material, challenge, 16);
+	memcpy(material + 16, passdigest, 16);
+	memcpy(material + 32, challenge + 16, 16);
+	return mfsblk_md5_buffer(material, sizeof(material), digest);
+}
+
+static u32 mfsblk_crc32(const void *data, u32 len)
+{
+	return crc32_le(~0U, data, len) ^ ~0U;
+}
+
+static int mfsblk_master_write_end_locked(struct mfsblk_dev *dev, u32 chunk_index,
+					  const struct mfsblk_chunk_desc *chunk,
+					  u32 chunk_offset, u32 size);
 
 static void mfsblk_close_socket(struct socket **psock)
 {
@@ -111,14 +160,14 @@ static int mfsblk_recv_packet(struct socket *sock, u32 *type, u8 **payload,
 	if (*payload_len > (MFSBLK_MAX_PACKET - 8))
 		return -EMSGSIZE;
 
-	*payload = kmalloc(*payload_len ?: 1, GFP_NOIO);
+	*payload = kvmalloc(*payload_len ?: 1, GFP_NOIO);
 	if (!*payload)
 		return -ENOMEM;
 
 	if (*payload_len) {
 		ret = mfsblk_sock_recvall(sock, *payload, *payload_len);
 		if (ret) {
-			kfree(*payload);
+			kvfree(*payload);
 			*payload = NULL;
 			return ret;
 		}
@@ -127,19 +176,521 @@ static int mfsblk_recv_packet(struct socket *sock, u32 *type, u8 **payload,
 	return 0;
 }
 
+static int mfsblk_recv_master_packet(struct socket *sock, u32 *type, u8 **payload,
+				     u32 *payload_len)
+{
+	int ret;
+
+	do {
+		ret = mfsblk_recv_packet(sock, type, payload, payload_len);
+		if (ret)
+			return ret;
+		if (*type == 0 && *payload_len == 4) {
+			kvfree(*payload);
+			*payload = NULL;
+			continue;
+		}
+		return 0;
+	} while (1);
+}
+
 void mfsblk_conn_close_master(struct mfsblk_dev *dev)
 {
 	mutex_lock(&dev->master_lock);
 	mfsblk_close_socket(&dev->master_sock);
+	dev->master_registered = false;
+	dev->master_version = 0;
+	dev->master_session_id = 0;
 	mutex_unlock(&dev->master_lock);
+}
+
+static int mfsblk_master_register_locked(struct mfsblk_dev *dev)
+{
+	u8 req[8 + 128];
+	u8 *rsp = NULL;
+	u8 challenge[32];
+	u8 passdigest[16];
+	u32 rsp_type;
+	u32 rsp_len;
+	u32 master_version = 0;
+	u32 session_id = 0;
+	int req_len;
+	int ret;
+
+	if (dev->master_registered)
+		return 0;
+
+	if (dev->password[0]) {
+		req_len = mfsblk_proto_build_register_getrandom_req(req, sizeof(req));
+		if (req_len < 0)
+			return req_len;
+
+		ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
+		if (ret)
+			return ret;
+
+		ret = mfsblk_recv_master_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
+		if (ret)
+			return ret;
+		if (rsp_type != MFSBLK_MATOCL_FUSE_REGISTER || rsp_len != 32) {
+			ret = -EPROTO;
+			goto out;
+		}
+		memcpy(challenge, rsp, sizeof(challenge));
+		kvfree(rsp);
+		rsp = NULL;
+
+		ret = mfsblk_md5_password_digest(dev->password, challenge, passdigest);
+		if (ret)
+			return ret;
+	}
+
+	req_len = mfsblk_proto_build_register_req(req, sizeof(req), "/",
+						  dev->password[0] ? passdigest : NULL);
+	if (req_len < 0)
+		return req_len;
+
+	ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
+	if (ret)
+		return ret;
+
+	ret = mfsblk_recv_master_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
+	if (ret)
+		return ret;
+
+	if (rsp_type != MFSBLK_MATOCL_FUSE_REGISTER) {
+		ret = -EPROTO;
+		goto out;
+	}
+
+	ret = mfsblk_proto_parse_register_rsp(rsp, rsp_len, &master_version,
+					      &session_id);
+	if (!ret) {
+		dev->master_version = master_version;
+		dev->master_session_id = session_id;
+		dev->master_registered = true;
+	}
+out:
+	kvfree(rsp);
+	return ret;
 }
 
 static int mfsblk_master_ensure_connected(struct mfsblk_dev *dev)
 {
-	if (dev->master_sock)
+	int ret;
+
+	if (!dev->master_sock) {
+		ret = mfsblk_open_socket(dev->master_ip, dev->master_port,
+					 &dev->master_sock);
+		if (ret)
+			return ret;
+		dev->master_registered = false;
+		dev->master_version = 0;
+		dev->master_session_id = 0;
+	}
+
+	ret = mfsblk_master_register_locked(dev);
+	if (ret) {
+		mfsblk_close_socket(&dev->master_sock);
+		dev->master_registered = false;
+	}
+
+	return ret;
+}
+
+static int mfsblk_master_lookup_path_locked(struct mfsblk_dev *dev, u32 *inode,
+					    u64 *size, u32 *parent_inode,
+					    char *leaf_name, size_t leaf_name_sz)
+{
+	u8 *req = NULL;
+	u8 *rsp = NULL;
+	u8 attr[36];
+	size_t leaf_len = 0;
+	u32 msgid;
+	u32 rsp_type;
+	u32 rsp_len;
+	int req_len;
+	int ret;
+	size_t req_cap = 8 + 24 + strlen(dev->image_path);
+
+	req = kmalloc(req_cap, GFP_NOIO);
+	if (!req)
+		return -ENOMEM;
+
+	msgid = (u32)atomic_inc_return(&dev->next_msgid);
+	req_len = mfsblk_proto_build_lookup_path_req(req, req_cap, msgid,
+						     dev->image_path);
+	if (req_len < 0) {
+		ret = req_len;
+		goto out;
+	}
+
+	ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
+	if (ret)
+		goto out;
+
+	ret = mfsblk_recv_master_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
+	if (ret)
+		goto out;
+
+	if (rsp_type != MFSBLK_MATOCL_PATH_LOOKUP) {
+		ret = -EPROTO;
+		goto out;
+	}
+
+	ret = mfsblk_proto_parse_lookup_path_rsp(rsp, rsp_len, msgid, parent_inode,
+						 inode, leaf_name, leaf_name_sz,
+						 &leaf_len, attr, sizeof(attr));
+	if (!ret) {
+		*size = (*inode != 0) ? mfsblk_proto_attr_size(attr, sizeof(attr)) : 0;
+		if (*inode != 0 && mfsblk_proto_attr_type(attr, sizeof(attr)) != 1)
+			ret = -EINVAL;
+	}
+out:
+	kvfree(rsp);
+	kfree(req);
+	return ret;
+}
+
+static int mfsblk_master_create_path_locked(struct mfsblk_dev *dev, u64 size,
+					    u32 parent_inode, const char *name,
+					    u32 *inode)
+{
+	u8 *req = NULL;
+	u8 *rsp = NULL;
+	u8 attr[36];
+	u32 msgid;
+	u32 rsp_type;
+	u32 rsp_len;
+	int req_len;
+	int ret;
+	size_t req_cap = 8 + 25 + strlen(name);
+
+	req = kmalloc(req_cap, GFP_NOIO);
+	if (!req)
+		return -ENOMEM;
+
+	msgid = (u32)atomic_inc_return(&dev->next_msgid);
+	req_len = mfsblk_proto_build_create_path_req(req, req_cap, msgid,
+						     parent_inode, name);
+	if (req_len < 0) {
+		ret = req_len;
+		goto out;
+	}
+
+	ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
+	if (ret)
+		goto out;
+
+	ret = mfsblk_recv_master_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
+	if (ret)
+		goto out;
+
+	if (rsp_type != MFSBLK_MATOCL_FUSE_CREATE) {
+		ret = -EPROTO;
+		goto out;
+	}
+
+	ret = mfsblk_proto_parse_create_path_rsp(rsp, rsp_len, msgid, inode, attr,
+						 sizeof(attr));
+	if (!ret && mfsblk_proto_attr_type(attr, sizeof(attr)) != 1)
+		ret = -EINVAL;
+	if (!ret && size)
+		dev->size_bytes = size;
+out:
+	kvfree(rsp);
+	kfree(req);
+	return ret;
+}
+
+static int mfsblk_master_truncate_locked(struct mfsblk_dev *dev, u64 size,
+					 u64 *actual_size)
+{
+	u8 req[8 + 29];
+	u8 *rsp = NULL;
+	u64 new_size = size;
+	u32 msgid;
+	u32 rsp_type;
+	u32 rsp_len;
+	int req_len;
+	int ret;
+	int attempt;
+
+	msgid = (u32)atomic_inc_return(&dev->next_msgid);
+	req_len = mfsblk_proto_build_truncate_req(req, sizeof(req), msgid,
+						  dev->inode, size);
+	if (req_len < 0)
+		return req_len;
+
+	for (attempt = 0; attempt < 2; attempt++) {
+		ret = mfsblk_master_ensure_connected(dev);
+		if (ret)
+			return ret;
+
+		ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
+		if (ret)
+			goto out_reset_retry;
+
+		ret = mfsblk_recv_master_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
+		if (ret)
+			goto out_reset_retry;
+
+		if (rsp_type != MFSBLK_MATOCL_FUSE_TRUNCATE) {
+			ret = -EPROTO;
+			goto out_reset_retry;
+		}
+
+		ret = mfsblk_proto_parse_truncate_rsp(rsp, rsp_len, msgid, &new_size);
+		kvfree(rsp);
+		mfsblk_close_socket(&dev->master_sock);
+		dev->master_registered = false;
+		dev->master_version = 0;
+		dev->master_session_id = 0;
+		if (!ret && actual_size)
+			*actual_size = new_size;
+		return ret;
+
+out_reset_retry:
+		kvfree(rsp);
+		rsp = NULL;
+		mfsblk_close_socket(&dev->master_sock);
+		dev->master_registered = false;
+		dev->master_version = 0;
+		dev->master_session_id = 0;
+		if (attempt == 0 &&
+		    (ret == -ECONNRESET || ret == -EPIPE || ret == -ENOTCONN))
+			continue;
+		return ret;
+	}
+
+	return -EIO;
+}
+
+int mfsblk_conn_resolve_image(struct mfsblk_dev *dev, bool inode_explicit,
+			      bool size_explicit)
+{
+	u32 inode = dev->inode;
+	u64 size = 0;
+	u32 parent_inode = 0;
+	char leaf_name[256];
+	int ret;
+
+	mutex_lock(&dev->master_lock);
+	ret = mfsblk_master_ensure_connected(dev);
+	if (ret)
+		goto out_unlock;
+
+	ret = mfsblk_master_lookup_path_locked(dev, &inode, &size, &parent_inode,
+					       leaf_name, sizeof(leaf_name));
+	if (!ret && inode == 0 && dev->size_bytes) {
+		ret = mfsblk_master_create_path_locked(dev, dev->size_bytes,
+						       parent_inode, leaf_name,
+						       &inode);
+		if (!ret)
+			size = dev->size_bytes;
+	}
+	if (!ret && inode)
+		dev->inode = inode;
+	if (!ret && size_explicit && inode) {
+		ret = mfsblk_master_truncate_locked(dev, dev->size_bytes, &size);
+		if (ret)
+			goto out_reset;
+	}
+	if (ret && ret != -EPROTO && ret != -EOPNOTSUPP && ret != -ENOTCONN)
+		goto out_reset;
+
+	if (!inode_explicit) {
+		if (!ret && inode)
+			dev->inode = inode;
+		else
+			dev->inode = mfsblk_proto_path_fallback_inode(dev->image_path);
+	}
+
+	if (!size_explicit) {
+		if (!ret && size)
+			dev->size_bytes = size;
+		else if (!dev->size_bytes)
+			dev->size_bytes = size;
+	}
+
+	if (!dev->size_bytes) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	mutex_unlock(&dev->master_lock);
+	return 0;
+
+out_reset:
+	mfsblk_close_socket(&dev->master_sock);
+	dev->master_registered = false;
+	dev->master_version = 0;
+	dev->master_session_id = 0;
+out_unlock:
+	mutex_unlock(&dev->master_lock);
+	return ret;
+}
+
+int mfsblk_conn_set_file_size(struct mfsblk_dev *dev, u64 size_bytes,
+			      u64 *actual_size)
+{
+	int ret;
+
+	if (!dev)
+		return -ENODEV;
+
+	mutex_lock(&dev->master_lock);
+	ret = mfsblk_master_truncate_locked(dev, size_bytes, actual_size);
+	mutex_unlock(&dev->master_lock);
+	return ret;
+}
+
+static int mfsblk_conn_flush_writes_locked(struct mfsblk_dev *dev)
+{
+	int ret;
+
+	if (!dev->write_active)
 		return 0;
 
-	return mfsblk_open_socket(dev->master_ip, dev->master_port, &dev->master_sock);
+	mutex_lock(&dev->master_lock);
+	ret = mfsblk_master_write_end_locked(dev,
+					     (u32)dev->write_chunk.chunk_index,
+					     &dev->write_chunk,
+					     dev->write_min_chunk_off,
+					     dev->write_max_chunk_end -
+					     dev->write_min_chunk_off);
+	mutex_unlock(&dev->master_lock);
+	if (!ret)
+		mfsblk_cache_invalidate_chunk(dev, dev->write_chunk.chunk_index);
+	dev->write_active = false;
+	memset(&dev->write_chunk, 0, sizeof(dev->write_chunk));
+	dev->write_file_size = 0;
+	dev->write_min_chunk_off = 0;
+	dev->write_max_chunk_end = 0;
+	return ret;
+}
+
+int mfsblk_conn_get_write_chunk(struct mfsblk_dev *dev, u64 chunk_index,
+				struct mfsblk_chunk_desc *out)
+{
+	struct mfsblk_chunk_desc chunk;
+	int ret;
+
+	if (dev->write_active && dev->write_chunk.chunk_index == chunk_index) {
+		*out = dev->write_chunk;
+		return 0;
+	}
+
+	if (dev->write_active) {
+		ret = mfsblk_conn_flush_writes_locked(dev);
+		if (ret)
+			return ret;
+	}
+
+	ret = mfsblk_conn_master_fetch_chunk(dev, chunk_index, true, &chunk);
+	if (ret)
+		return ret;
+
+	chunk.chunk_index = chunk_index;
+	dev->write_active = true;
+	dev->write_chunk = chunk;
+	dev->write_file_size = chunk.file_length;
+	dev->write_min_chunk_off = UINT_MAX;
+	dev->write_max_chunk_end = 0;
+	*out = chunk;
+	return 0;
+}
+
+void mfsblk_conn_note_written(struct mfsblk_dev *dev, u64 chunk_index,
+			      u32 chunk_offset, u32 len)
+{
+	u64 end = chunk_index * (u64)MFSBLK_CHUNK_SIZE + chunk_offset + len;
+
+	if (!dev->write_active || dev->write_chunk.chunk_index != chunk_index)
+		return;
+
+	if (dev->write_min_chunk_off > chunk_offset)
+		dev->write_min_chunk_off = chunk_offset;
+	if (dev->write_max_chunk_end < chunk_offset + len)
+		dev->write_max_chunk_end = chunk_offset + len;
+	if (dev->write_file_size < end)
+		dev->write_file_size = end;
+	if (dev->write_chunk.file_length < end)
+		dev->write_chunk.file_length = end;
+}
+
+int mfsblk_conn_flush_writes(struct mfsblk_dev *dev)
+{
+	return mfsblk_conn_flush_writes_locked(dev);
+}
+
+static int mfsblk_master_write_end_locked(struct mfsblk_dev *dev, u32 chunk_index,
+					  const struct mfsblk_chunk_desc *chunk,
+					  u32 chunk_offset, u32 size)
+{
+	u8 req[8 + 37];
+	u8 *rsp = NULL;
+	u64 new_length;
+	u32 msgid;
+	u32 rsp_type;
+	u32 rsp_len;
+	int req_len;
+	int ret;
+	int attempt;
+
+	new_length = max_t(u64, chunk->file_length,
+			   chunk_index * (u64)MFSBLK_CHUNK_SIZE +
+			   chunk_offset + size);
+	msgid = (u32)atomic_inc_return(&dev->next_msgid);
+
+	req_len = mfsblk_proto_build_master_write_end_req(req, sizeof(req),
+							  dev->master_version,
+							  msgid,
+							  chunk->chunk_id,
+							  dev->inode, chunk_index,
+							  new_length,
+							  chunk_offset, size);
+	if (req_len < 0)
+		return req_len;
+
+	for (attempt = 0; attempt < 2; attempt++) {
+		ret = mfsblk_master_ensure_connected(dev);
+		if (ret)
+			return ret;
+
+		ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
+		if (ret)
+			goto out_reset_retry;
+
+		ret = mfsblk_recv_master_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
+		if (ret)
+			goto out_reset_retry;
+
+		if (rsp_type != MFSBLK_MATOCL_FUSE_WRITE_CHUNK_END) {
+			ret = -EPROTO;
+			goto out_reset_retry;
+		}
+
+		ret = mfsblk_proto_parse_master_write_end_rsp(rsp, rsp_len, msgid);
+		kvfree(rsp);
+		mfsblk_close_socket(&dev->master_sock);
+		dev->master_registered = false;
+		return ret;
+
+out_reset_retry:
+		kvfree(rsp);
+		rsp = NULL;
+		mfsblk_close_socket(&dev->master_sock);
+		dev->master_registered = false;
+		dev->master_version = 0;
+		dev->master_session_id = 0;
+		if (attempt == 0 &&
+		    (ret == -ECONNRESET || ret == -EPIPE || ret == -ENOTCONN))
+			continue;
+		return ret;
+	}
+
+	return -EIO;
 }
 
 int mfsblk_conn_master_fetch_chunk(struct mfsblk_dev *dev, u64 chunk_index,
@@ -153,6 +704,7 @@ int mfsblk_conn_master_fetch_chunk(struct mfsblk_dev *dev, u64 chunk_index,
 	u32 expected;
 	int req_len;
 	int ret;
+	int attempt;
 
 	if (chunk_index > U32_MAX)
 		return -EFBIG;
@@ -165,36 +717,51 @@ int mfsblk_conn_master_fetch_chunk(struct mfsblk_dev *dev, u64 chunk_index,
 		return req_len;
 
 	mutex_lock(&dev->master_lock);
-	ret = mfsblk_master_ensure_connected(dev);
-	if (ret)
+	for (attempt = 0; attempt < 2; attempt++) {
+		ret = mfsblk_master_ensure_connected(dev);
+		if (ret)
+			goto out_unlock;
+
+		ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
+		if (ret)
+			goto out_reset_retry;
+
+		ret = mfsblk_recv_master_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
+		if (ret)
+			goto out_reset_retry;
+
+		expected = write ? MFSBLK_MATOCL_FUSE_WRITE_CHUNK : MFSBLK_MATOCL_FUSE_READ_CHUNK;
+		if (rsp_type != expected) {
+			ret = -EPROTO;
+			goto out_reset_retry;
+		}
+
+		ret = mfsblk_proto_parse_master_chunk_rsp(rsp, rsp_len, msgid, write, out);
+		if (ret)
+			goto out_reset_retry;
+
+		kvfree(rsp);
+		mfsblk_close_socket(&dev->master_sock);
+		dev->master_registered = false;
+		mutex_unlock(&dev->master_lock);
+		return 0;
+
+out_reset_retry:
+		kvfree(rsp);
+		rsp = NULL;
+		mfsblk_close_socket(&dev->master_sock);
+		dev->master_registered = false;
+		dev->master_version = 0;
+		dev->master_session_id = 0;
+		if (attempt == 0 &&
+		    (ret == -ECONNRESET || ret == -EPIPE || ret == -ENOTCONN))
+			continue;
 		goto out_unlock;
-
-	ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
-	if (ret)
-		goto out_reset;
-
-	ret = mfsblk_recv_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
-	if (ret)
-		goto out_reset;
-
-	expected = write ? MFSBLK_MATOCL_FUSE_WRITE_CHUNK : MFSBLK_MATOCL_FUSE_READ_CHUNK;
-	if (rsp_type != expected) {
-		ret = -EPROTO;
-		goto out_reset;
 	}
 
-	ret = mfsblk_proto_parse_master_chunk_rsp(rsp, rsp_len, msgid, out);
-	if (ret)
-		goto out_reset;
-
-	kfree(rsp);
-	mutex_unlock(&dev->master_lock);
-	return 0;
-
-out_reset:
-	mfsblk_close_socket(&dev->master_sock);
+	ret = -EIO;
 out_unlock:
-	kfree(rsp);
+	kvfree(rsp);
 	mutex_unlock(&dev->master_lock);
 	return ret;
 }
@@ -249,7 +816,7 @@ static int mfsblk_cs_read_one(struct mfsblk_cs_conn *conn,
 			copy_len = min_t(u32, rd.size, (chunk_offset + len) - data_off);
 			memcpy((u8 *)dst + (data_off - chunk_offset), rd.data, copy_len);
 			rx_sum += copy_len;
-			kfree(payload);
+			kvfree(payload);
 			payload = NULL;
 			continue;
 		}
@@ -265,8 +832,9 @@ static int mfsblk_cs_read_one(struct mfsblk_cs_conn *conn,
 			}
 			status = payload[8];
 			ret = mfsblk_proto_status_to_errno(status);
-			if (ret)
+			if (ret) {
 				goto out;
+			}
 			if (rx_sum < len) {
 				ret = -EIO;
 				goto out;
@@ -277,7 +845,7 @@ static int mfsblk_cs_read_one(struct mfsblk_cs_conn *conn,
 
 		ret = -EPROTO;
 out:
-		kfree(payload);
+		kvfree(payload);
 		return ret;
 	}
 }
@@ -317,31 +885,34 @@ int mfsblk_conn_chunk_read(struct mfsblk_dev *dev,
 static int mfsblk_cs_recv_write_status(struct mfsblk_cs_conn *conn,
 				       struct mfsblk_cs_write_status *st)
 {
-	u8 *payload = NULL;
-	u32 type;
-	u32 len;
-	int ret;
+	for (;;) {
+		u8 *payload = NULL;
+		u32 type;
+		u32 len;
+		int ret;
 
-	ret = mfsblk_recv_packet(conn->sock, &type, &payload, &len);
-	if (ret)
-		return ret;
+		ret = mfsblk_recv_packet(conn->sock, &type, &payload, &len);
+		if (ret)
+			return ret;
 
-	if (type != MFSBLK_CSTOCL_WRITE_STATUS) {
-		kfree(payload);
-		return -EPROTO;
+		if (type != MFSBLK_CSTOCL_WRITE_STATUS) {
+			kvfree(payload);
+			continue;
+		}
+
+		ret = mfsblk_proto_parse_cs_write_status(payload, len, st);
+		kvfree(payload);
+		if (ret)
+			return ret;
+
+		return mfsblk_proto_status_to_errno(st->status);
 	}
-
-	ret = mfsblk_proto_parse_cs_write_status(payload, len, st);
-	kfree(payload);
-	if (ret)
-		return ret;
-
-	return mfsblk_proto_status_to_errno(st->status);
 }
 
 static int mfsblk_cs_write_one(struct mfsblk_cs_conn *conn,
 			       const struct mfsblk_chunk_desc *chunk,
-			       u32 chunk_offset, const void *src, u32 len)
+			       u32 start_server, u32 chunk_offset,
+			       const void *src, u32 len)
 {
 	u8 *pkt;
 	u32 write_id = 1;
@@ -350,12 +921,14 @@ static int mfsblk_cs_write_one(struct mfsblk_cs_conn *conn,
 	int ret;
 	struct mfsblk_cs_write_status st;
 
-	pkt = kmalloc(MFSBLK_MAX_PACKET, GFP_NOIO);
+	pkt = kvmalloc(MFSBLK_MAX_PACKET, GFP_NOIO);
 	if (!pkt)
 		return -ENOMEM;
 
 	pkt_len = mfsblk_proto_build_cs_write_init(pkt, MFSBLK_MAX_PACKET,
-					   chunk->chunk_id, chunk->version);
+					   chunk->chunk_id, chunk->version,
+					   chunk->servers + start_server + 1,
+					   chunk->server_count - start_server - 1);
 	if (pkt_len < 0) {
 		ret = pkt_len;
 		goto out;
@@ -378,7 +951,7 @@ static int mfsblk_cs_write_one(struct mfsblk_cs_conn *conn,
 		u16 block_num = chunk_pos / MFSBLK_BLOCK_SIZE;
 		u16 block_off = chunk_pos % MFSBLK_BLOCK_SIZE;
 		u32 part = min_t(u32, len - done, MFSBLK_BLOCK_SIZE - block_off);
-		u32 crc = crc32(0, (const u8 *)src + done, part);
+		u32 crc = mfsblk_crc32((const u8 *)src + done, part);
 
 		pkt_len = mfsblk_proto_build_cs_write_data(pkt, MFSBLK_MAX_PACKET,
 						   chunk->chunk_id, write_id,
@@ -417,17 +990,15 @@ static int mfsblk_cs_write_one(struct mfsblk_cs_conn *conn,
 	if (ret)
 		goto out;
 
-	ret = mfsblk_cs_recv_write_status(conn, &st);
-	if (ret)
-		goto out;
-	if (st.chunk_id != chunk->chunk_id) {
-		ret = -EPROTO;
-		goto out;
-	}
-
+	/*
+	 * Chunkservers may tear down the write socket after WRITE_FINISH.
+	 * Drop the cached connection so the next write starts with a fresh
+	 * session instead of racing a remote close into -ECONNRESET.
+	 */
+	mfsblk_close_socket(&conn->sock);
 	ret = 0;
 out:
-	kfree(pkt);
+	kvfree(pkt);
 	return ret;
 }
 
@@ -437,6 +1008,7 @@ int mfsblk_conn_chunk_write(struct mfsblk_dev *dev,
 {
 	u8 i;
 	int ret = -ENODEV;
+	u32 chunk_index = chunk->chunk_index;
 
 	if (chunk->split_parts)
 		return -EOPNOTSUPP;
@@ -450,14 +1022,25 @@ int mfsblk_conn_chunk_write(struct mfsblk_dev *dev,
 			continue;
 
 		mutex_lock(&conn->io_lock);
-		ret = mfsblk_cs_write_one(conn, chunk, chunk_offset, src, len);
+		ret = mfsblk_cs_write_one(conn, chunk, i, chunk_offset, src, len);
 		if (ret)
 			mfsblk_close_socket(&conn->sock);
 		mutex_unlock(&conn->io_lock);
 		mfsblk_cache_put_conn(conn);
 
-		if (!ret)
+		if (!ret) {
+			mutex_lock(&dev->master_lock);
+			ret = mfsblk_master_write_end_locked(dev, chunk_index,
+							     chunk, chunk_offset,
+							     len);
+			mutex_unlock(&dev->master_lock);
+			if (ret) {
+				mfsblk_cache_invalidate_chunk(dev, chunk_index);
+				return ret;
+			}
+			mfsblk_cache_invalidate_chunk(dev, chunk_index);
 			return 0;
+		}
 	}
 
 	return ret;

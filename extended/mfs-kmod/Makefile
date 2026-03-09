@@ -5,7 +5,7 @@ else
 PWD := $(shell pwd)
 KDIR ?= /lib/modules/$(shell uname -r)/build
 CC ?= cc
-CFLAGS_HELPER ?= -O2 -Wall -Wextra -Wpedantic -std=gnu11
+CFLAGS_HELPER ?= -O2 -Wall -Wextra -Wpedantic -std=gnu11 -pthread
 
 .PHONY: all module helper clean install
 
@@ -16,8 +16,8 @@ module:
 
 helper: mfskmod-helper
 
-mfskmod-helper: mfskmod-helper.c mfs_ctrl_proto.h
-	$(CC) $(CFLAGS_HELPER) -o $@ mfskmod-helper.c
+mfskmod-helper: mfskmod-helper.c mfs_ctrl_proto.h ../../mfscommon/md5.c ../../mfscommon/md5.h
+	$(CC) $(CFLAGS_HELPER) -I../../mfscommon -o $@ mfskmod-helper.c ../../mfscommon/md5.c
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean

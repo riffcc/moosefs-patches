@@ -81,15 +81,28 @@ int mfsblk_io_rw(struct mfsblk_dev *dev, bool write, u64 offset, void *buffer,
 	u64 end;
 	u64 done = 0;
 	u8 *ptr = buffer;
+	bool locked = false;
+	int ret = 0;
 
 	if (check_add_overflow(offset, (u64)len, &end))
 		return -ERANGE;
 
+	if (write) {
+		mutex_lock(&dev->write_lock);
+		locked = true;
+	}
+
 	if (offset >= dev->size_bytes) {
 		if (write)
-			return -ENOSPC;
-		memset(buffer, 0, len);
-		return 0;
+			ret = -ENOSPC;
+		else
+			memset(buffer, 0, len);
+		goto out_unlock;
+	}
+	if (!write && end > dev->size_bytes) {
+		u64 clipped = dev->size_bytes - offset;
+
+		memset(ptr + clipped, 0, len - clipped);
 	}
 
 	if (end > dev->size_bytes) {
@@ -107,16 +120,21 @@ int mfsblk_io_rw(struct mfsblk_dev *dev, bool write, u64 offset, void *buffer,
 		u64 chunk_idx = div_u64(abs, MFSBLK_CHUNK_SIZE);
 		u32 chunk_off = do_div(abs, MFSBLK_CHUNK_SIZE);
 		u32 part = min_t(u32, len - done, MFSBLK_CHUNK_SIZE - chunk_off);
-		int ret;
 
-		ret = mfsblk_cache_get_chunk(dev, chunk_idx, write, &chunk);
+		if (write)
+			ret = mfsblk_conn_get_write_chunk(dev, chunk_idx, &chunk);
+		else
+			ret = mfsblk_cache_get_chunk(dev, chunk_idx, false, &chunk);
 		if (ret)
-			return ret;
+			goto out_unlock;
 
 		if (!chunk.chunk_id) {
 			if (write)
-				return -ENODATA;
-			memset(ptr + done, 0, part);
+				ret = -ENODATA;
+			else
+				memset(ptr + done, 0, part);
+			if (ret)
+				goto out_unlock;
 			done += part;
 			continue;
 		}
@@ -125,18 +143,22 @@ int mfsblk_io_rw(struct mfsblk_dev *dev, bool write, u64 offset, void *buffer,
 			ret = mfsblk_conn_chunk_write(dev, &chunk, chunk_off,
 						      ptr + done, part);
 			if (ret)
-				return ret;
+				goto out_unlock;
+			mfsblk_conn_note_written(dev, chunk_idx, chunk_off, part);
 		} else {
 			ret = mfsblk_conn_chunk_read(dev, &chunk, chunk_off,
 						     ptr + done, part);
 			if (ret)
-				return ret;
+				goto out_unlock;
 		}
 
 		done += part;
 	}
 
-	return 0;
+out_unlock:
+	if (locked)
+		mutex_unlock(&dev->write_lock);
+	return ret;
 }
 
 int mfsblk_io_discard(struct mfsblk_dev *dev, u64 offset, u64 len)
@@ -171,28 +193,34 @@ static int mfsblk_handle_rw_rq(struct mfsblk_dev *dev, struct request *rq,
 {
 	struct req_iterator iter;
 	struct bio_vec bvec;
+	u8 *bounce;
 	u64 pos = (u64)blk_rq_pos(rq) << MFSBLK_SECTOR_SHIFT;
+	u32 total = blk_rq_bytes(rq);
+	u32 done = 0;
 	int ret = 0;
 
+	bounce = kvmalloc(total, GFP_NOIO);
+	if (!bounce)
+		return -ENOMEM;
+
 	rq_for_each_segment(bvec, rq, iter) {
-		u8 *bounce;
-
-		bounce = kmalloc(bvec.bv_len, GFP_NOIO);
-		if (!bounce)
-			return -ENOMEM;
-
 		if (write)
-			mfsblk_copy_from_bvec(bounce, &bvec);
-
-		ret = mfsblk_io_rw(dev, write, pos, bounce, bvec.bv_len);
-		if (!ret && !write)
-			mfsblk_copy_to_bvec(&bvec, bounce);
-
-		kfree(bounce);
-		if (ret)
-			return ret;
-		pos += bvec.bv_len;
+			mfsblk_copy_from_bvec(bounce + done, &bvec);
+		done += bvec.bv_len;
 	}
+
+	ret = mfsblk_io_rw(dev, write, pos, bounce, total);
+	if (!ret && !write) {
+		done = 0;
+		rq_for_each_segment(bvec, rq, iter) {
+			mfsblk_copy_to_bvec(&bvec, bounce + done);
+			done += bvec.bv_len;
+		}
+	}
+
+	kvfree(bounce);
+	if (ret)
+		return ret;
 
 	return 0;
 }
@@ -221,7 +249,10 @@ static int mfsblk_handle_rq(struct mfsblk_dev *dev, struct request *rq)
 			(u64)blk_rq_pos(rq) << MFSBLK_SECTOR_SHIFT,
 			blk_rq_bytes(rq));
 	case REQ_OP_FLUSH:
-		return 0;
+		mutex_lock(&dev->write_lock);
+		ret = mfsblk_conn_flush_writes(dev);
+		mutex_unlock(&dev->write_lock);
+		return ret;
 	default:
 		return -EOPNOTSUPP;
 	}

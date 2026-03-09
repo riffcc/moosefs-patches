@@ -1,0 +1,8 @@
+[package]
+name = "mfs-kmod-rs-logic"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust logic and wire-format tests for MooseFS Rust kernel port"
+
+[lib]
+path = "src/lib.rs"

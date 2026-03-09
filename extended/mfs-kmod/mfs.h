@@ -22,6 +22,7 @@
 #include <linux/mount.h>
 #include <linux/version.h>
 #include <linux/iversion.h>
+#include <linux/workqueue.h>
 
 #include "mfs_ctrl_proto.h"
 
@@ -58,6 +59,31 @@
 	(inode)->i_ctime.tv_sec = (sec);			\
 	(inode)->i_ctime.tv_nsec = 0;				\
 } while (0)
+#endif
+
+/*
+ * Kernel API compatibility — version boundary summary:
+ *
+ *   5.16+   read_folio replaces readpage
+ *   6.7+    inode time accessors (inode_set_mtime_to_ts etc.)
+ *   6.8+    dirty_folio replaces set_page_dirty; grab_cache_page_write_begin
+ *           deprecated (use __filemap_get_folio + FGP_WRITEBEGIN);
+ *           SetPageError removed
+ *   6.12+   write_begin/write_end signatures changed from struct page to
+ *           struct folio; no_llseek removed (use noop_llseek);
+ *           __set_page_dirty_nobuffers removed
+ *   6.15+   mkdir returns struct dentry * instead of int
+ *   6.15+   mount_nodev removed (use init_fs_context + get_tree_nodev)
+ */
+
+/* Helper to convert int return to struct dentry * for 6.15+ mkdir */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+static inline struct dentry *mfs_int_to_dentry_result(int ret)
+{
+	if (ret)
+		return ERR_PTR(ret);
+	return NULL;
+}
 #endif
 
 #define MFS_SUPER_MAGIC 0x4d46534dU
@@ -147,6 +173,12 @@ struct mfs_inode_info {
 	u64 known_size;
 	u8 type;
 	u8 attr_valid;
+	struct mutex write_lock;
+	struct list_head write_queue;
+	struct work_struct write_work;
+	wait_queue_head_t write_wait;
+	int write_error;
+	bool write_worker_running;
 };
 
 static inline struct mfs_sb_info *MFS_SB(struct super_block *sb)
@@ -211,13 +243,24 @@ extern const struct inode_operations mfs_special_inode_ops;
 
 /* mfs_dir.c */
 extern const struct file_operations mfs_dir_ops;
+/* mkdir callback: returns struct dentry * on 6.15+, int on older kernels */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+struct dentry *mfs_mkdir_op(struct mnt_idmap *idmap, struct inode *dir,
+			    struct dentry *dentry, umode_t mode);
+#else
 int mfs_mkdir_op(struct mnt_idmap *idmap, struct inode *dir,
 		 struct dentry *dentry, umode_t mode);
+#endif
 int mfs_rmdir_op(struct inode *dir, struct dentry *dentry);
 
 /* mfs_file.c */
 extern const struct file_operations mfs_file_ops;
 extern const struct address_space_operations mfs_aops;
+void mfs_inode_async_init(struct mfs_inode_info *mi);
+void mfs_inode_async_destroy(struct mfs_inode_info *mi);
+int mfs_inode_async_queue_write(struct inode *inode, loff_t offset,
+				const void *data, u32 len);
+int mfs_inode_async_flush(struct inode *inode);
 
 /* mfs_symlink.c */
 int mfs_symlink_op(struct mnt_idmap *idmap, struct inode *dir,

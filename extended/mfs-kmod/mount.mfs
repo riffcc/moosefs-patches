@@ -3,38 +3,99 @@ set -eu
 
 HELPER_BIN="${MFS_HELPER_BIN:-/usr/sbin/mfskmod-helper}"
 CTRL_DEV="${MFS_CTRL_DEV:-/dev/mfs_ctrl}"
+MODULE_PATH="${MFS_MODULE_PATH:-}"
+MODULE_VERSION_EXPECTED="${MFS_MODULE_VERSION:-}"
+
+# Parse arguments manually — mount passes them as:
+#   mount.mfs <source> <target> [-o <opts>]
+# POSIX getopts cannot handle options after positional args,
+# so we walk the argument list ourselves.
 
 opts=""
-while getopts "o:" opt; do
-	case "$opt" in
-		o) opts="$OPTARG" ;;
-		*) ;;
-	esac
-done
-shift $((OPTIND-1))
+source=""
+target=""
 
-if [ "$#" -lt 2 ]; then
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-o)
+			shift
+			opts="$1"
+			;;
+		-*)
+			# ignore unknown flags (e.g. -n, -v)
+			;;
+		*)
+			if [ -z "$source" ]; then
+				source="$1"
+			elif [ -z "$target" ]; then
+				target="$1"
+			fi
+			;;
+	esac
+	shift
+done
+
+if [ -z "$source" ] || [ -z "$target" ]; then
 	echo "usage: mount.mfs <source> <target> [-o opts]" >&2
 	exit 2
 fi
 
-source="$1"
-target="$2"
-
+# If no master= option given, derive from source (the "device" name).
+# Skip this if source is "none" or empty — use kernel defaults instead.
 if [ -z "$opts" ]; then
-	opts="master=$source"
+	case "$source" in
+		none|"")
+			# No useful source, let kernel use its defaults
+			opts=""
+			;;
+		*)
+			opts="master=$source"
+			;;
+	esac
 else
 	case ",$opts," in
-	*,master=*,*) ;;
-	*) opts="master=$source,$opts" ;;
+		*,master=*,*)
+			# master already specified, don't override
+			;;
+		*)
+			case "$source" in
+				none|"")
+					# No useful source to prepend
+					;;
+				*)
+					opts="master=$source,$opts"
+					;;
+			esac
+			;;
 	esac
 fi
 
+maybe_reload_module() {
+	if [ -z "$MODULE_VERSION_EXPECTED" ] || [ ! -r /sys/module/mfs/version ]; then
+		return 1
+	fi
+
+	loaded_version="$(cat /sys/module/mfs/version 2>/dev/null || true)"
+	[ "$loaded_version" != "$MODULE_VERSION_EXPECTED" ]
+}
+
+# Ensure the kernel module is loaded, and optionally force the expected build.
+if maybe_reload_module; then
+	umount "$target" >/dev/null 2>&1 || umount -l "$target" >/dev/null 2>&1 || true
+	modprobe -r mfs >/dev/null 2>&1 || true
+	rm -f "$CTRL_DEV"
+fi
+
 if [ ! -c "$CTRL_DEV" ]; then
-	modprobe mfs >/dev/null 2>&1 || true
+	if [ -n "$MODULE_PATH" ] && [ -f "$MODULE_PATH" ]; then
+		insmod "$MODULE_PATH" >/dev/null 2>&1 || true
+	else
+		modprobe mfs >/dev/null 2>&1 || true
+	fi
 	sleep 0.2
 fi
 
+# Start the helper daemon if not already running
 if ! pgrep -f "[m]fskmod-helper.*-d $CTRL_DEV" >/dev/null 2>&1; then
 	if [ -x "$HELPER_BIN" ]; then
 		"$HELPER_BIN" -d "$CTRL_DEV" >/dev/null 2>&1 &
@@ -45,4 +106,8 @@ if ! pgrep -f "[m]fskmod-helper.*-d $CTRL_DEV" >/dev/null 2>&1; then
 	fi
 fi
 
-exec mount -i -t mfs -o "$opts" none "$target"
+if [ -n "$opts" ]; then
+	exec mount -i -t mfs -o "$opts" none "$target"
+else
+	exec mount -i -t mfs none "$target"
+fi

@@ -7,6 +7,7 @@
 #include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 
 #include "mfsblk.h"
 
@@ -168,6 +169,100 @@ void mfsblk_dev_module_exit(void)
 	mfsblk_major = 0;
 }
 
+static void mfsblk_dev_publish_size(struct mfsblk_dev *dev)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
+	set_capacity_and_notify(dev->disk,
+				div_u64(dev->size_bytes, MFSBLK_SECTOR_SIZE));
+#else
+	set_capacity(dev->disk, div_u64(dev->size_bytes, MFSBLK_SECTOR_SIZE));
+#endif
+}
+
+int mfsblk_dev_resize(struct mfsblk_dev *dev)
+{
+	u64 old_size;
+	int ret;
+
+	if (!dev || !dev->disk)
+		return -ENODEV;
+
+	old_size = dev->size_bytes;
+	ret = mfsblk_conn_resolve_image(dev, false, false);
+	if (ret)
+		return ret;
+
+	if (!dev->size_bytes)
+		return -EINVAL;
+
+	if (dev->queue)
+		blk_mq_quiesce_queue(dev->queue);
+	if (dev->io_wq)
+		flush_workqueue(dev->io_wq);
+	mutex_lock(&dev->write_lock);
+	ret = mfsblk_conn_flush_writes(dev);
+	mutex_unlock(&dev->write_lock);
+	if (ret) {
+		if (dev->queue)
+			blk_mq_unquiesce_queue(dev->queue);
+		return ret;
+	}
+
+	mfsblk_cache_invalidate_all(dev);
+	mfsblk_dev_publish_size(dev);
+	if (dev->queue)
+		blk_mq_unquiesce_queue(dev->queue);
+
+	if (old_size != dev->size_bytes)
+		pr_info("mfsblk: resized %s from %llu to %llu bytes\n",
+			dev->name, (unsigned long long)old_size,
+			(unsigned long long)dev->size_bytes);
+
+	return 0;
+}
+
+int mfsblk_dev_set_size(struct mfsblk_dev *dev, u64 size_bytes)
+{
+	u64 old_size;
+	u64 actual_size = size_bytes;
+	int ret;
+
+	if (!dev || !dev->disk)
+		return -ENODEV;
+	if (!size_bytes)
+		return -EINVAL;
+
+	old_size = dev->size_bytes;
+
+	if (dev->queue)
+		blk_mq_quiesce_queue(dev->queue);
+	if (dev->io_wq)
+		flush_workqueue(dev->io_wq);
+	mutex_lock(&dev->write_lock);
+	ret = mfsblk_conn_flush_writes(dev);
+	mutex_unlock(&dev->write_lock);
+	if (ret)
+		goto out_unquiesce;
+
+	ret = mfsblk_conn_set_file_size(dev, size_bytes, &actual_size);
+	if (ret)
+		goto out_unquiesce;
+
+	dev->size_bytes = actual_size;
+	mfsblk_cache_invalidate_all(dev);
+	mfsblk_dev_publish_size(dev);
+
+	if (old_size != dev->size_bytes)
+		pr_info("mfsblk: resized %s from %llu to %llu bytes\n",
+			dev->name, (unsigned long long)old_size,
+			(unsigned long long)dev->size_bytes);
+
+out_unquiesce:
+	if (dev->queue)
+		blk_mq_unquiesce_queue(dev->queue);
+	return ret;
+}
+
 static int mfsblk_register_ctrl_dev(struct mfsblk_dev *dev)
 {
 	int ret;
@@ -216,7 +311,29 @@ static int mfsblk_setup_disk(struct mfsblk_dev *dev)
 {
 	int ret;
 
-	/* Kernel 5.15+: blk_mq_alloc_disk allocates both gendisk and queue */
+	/* Kernel 6.6+: Use new blk_mq_alloc_disk API with queue_limits */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+	struct queue_limits lim = {
+		.logical_block_size = MFSBLK_SECTOR_SIZE,
+		.physical_block_size = MFSBLK_BLOCK_SIZE,
+		.io_min = MFSBLK_BLOCK_SIZE,
+		.io_opt = MFSBLK_BLOCK_SIZE,
+		.max_hw_sectors = MFSBLK_CHUNK_SIZE >> MFSBLK_SECTOR_SHIFT,
+		.max_discard_sectors = MFSBLK_CHUNK_SIZE >> MFSBLK_SECTOR_SHIFT,
+		/* Don't set ROTATIONAL, indicating SSD-like behavior */
+	};
+
+	dev->disk = blk_mq_alloc_disk(&dev->tag_set, &lim, dev);
+	if (IS_ERR(dev->disk)) {
+		ret = PTR_ERR(dev->disk);
+		dev->disk = NULL;
+		return ret;
+	}
+	dev->queue = dev->disk->queue;
+
+#else
+	/* Kernel 5.15-6.5: blk_mq_alloc_disk allocates both gendisk and queue,
+	 * but we need to use blk_queue_* functions to set limits */
 	dev->disk = blk_mq_alloc_disk(&dev->tag_set, dev);
 	if (IS_ERR(dev->disk)) {
 		ret = PTR_ERR(dev->disk);
@@ -234,12 +351,19 @@ static int mfsblk_setup_disk(struct mfsblk_dev *dev)
 	blk_queue_max_discard_sectors(dev->queue,
 				      MFSBLK_CHUNK_SIZE >> MFSBLK_SECTOR_SHIFT);
 	/* blk_queue_discard_granularity() removed in kernel 6.8;
-	 * the kernel uses logical block size as default granularity. */
+	 * the kernel uses logical block size as default granularity.
+	 * QUEUE_FLAG_NONROT removed in 6.10+, only set if available */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
 	blk_queue_flag_set(QUEUE_FLAG_NONROT, dev->queue);
+#endif
+
+#endif
 
 	dev->disk->major = mfsblk_major;
 	dev->disk->first_minor = dev->id;
 	dev->disk->minors = 1;
+	dev->disk->flags |= GENHD_FL_NO_PART;
+	set_bit(GD_SUPPRESS_PART_SCAN, &dev->disk->state);
 	dev->disk->fops = &mfsblk_fops;
 	dev->disk->private_data = dev;
 	strscpy(dev->disk->disk_name, dev->name, sizeof(dev->disk->disk_name));
@@ -270,6 +394,7 @@ int mfsblk_dev_create(const struct mfsblk_map_spec *spec, struct mfsblk_dev **ou
 	mutex_init(&dev->master_lock);
 	mutex_init(&dev->cache_lock);
 	mutex_init(&dev->conn_lock);
+	mutex_init(&dev->write_lock);
 	spin_lock_init(&dev->state_lock);
 	atomic_set(&dev->next_msgid, 1);
 
@@ -279,6 +404,7 @@ int mfsblk_dev_create(const struct mfsblk_map_spec *spec, struct mfsblk_dev **ou
 	dev->size_bytes = spec->size_bytes;
 	dev->inode = spec->inode;
 	strscpy(dev->master_host, spec->master_host, sizeof(dev->master_host));
+	strscpy(dev->password, spec->password, sizeof(dev->password));
 	strscpy(dev->image_path, spec->image_path, sizeof(dev->image_path));
 	snprintf(dev->name, sizeof(dev->name), "%s%d", MFSBLK_DISK_PREFIX, dev->id);
 
@@ -291,6 +417,11 @@ int mfsblk_dev_create(const struct mfsblk_map_spec *spec, struct mfsblk_dev **ou
 	atomic_set(&dev->stats.inflight, 0);
 
 	mfsblk_cache_init(dev);
+
+	ret = mfsblk_conn_resolve_image(dev, spec->inode_explicit,
+					spec->size_explicit);
+	if (ret)
+		goto err_free;
 
 	dev->io_wq = alloc_workqueue("mfsblk_io/%d", WQ_UNBOUND | WQ_MEM_RECLAIM,
 				    0, dev->id);
@@ -341,6 +472,9 @@ void mfsblk_dev_destroy(struct mfsblk_dev *dev)
 		blk_mq_quiesce_queue(dev->queue);
 	if (dev->io_wq)
 		flush_workqueue(dev->io_wq);
+	mutex_lock(&dev->write_lock);
+	mfsblk_conn_flush_writes(dev);
+	mutex_unlock(&dev->write_lock);
 
 	if (dev->disk) {
 		del_gendisk(dev->disk);

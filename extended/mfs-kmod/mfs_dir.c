@@ -98,8 +98,11 @@ static int mfs_iterate_shared(struct file *file, struct dir_context *ctx)
 	return 0;
 }
 
-int mfs_mkdir_op(struct mnt_idmap *idmap, struct inode *dir,
-		 struct dentry *dentry, umode_t mode)
+/*
+ * Implementation of mkdir operation - always returns int
+ */
+static int mfs_mkdir_op_impl(struct mnt_idmap *idmap, struct inode *dir,
+			     struct dentry *dentry, umode_t mode)
 {
 	struct mfs_ctrl_mkdir_req *req;
 	struct mfs_ctrl_create_rsp *rsp;
@@ -148,6 +151,24 @@ int mfs_mkdir_op(struct mnt_idmap *idmap, struct inode *dir,
 	mfs_update_dir_times(dir);
 	return 0;
 }
+
+/*
+ * Wrapper for inode_operations.mkdir callback.
+ * Kernel 6.15+ expects struct dentry * return; older kernels expect int.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+struct dentry *mfs_mkdir_op(struct mnt_idmap *idmap, struct inode *dir,
+			    struct dentry *dentry, umode_t mode)
+{
+	return mfs_int_to_dentry_result(mfs_mkdir_op_impl(idmap, dir, dentry, mode));
+}
+#else
+int mfs_mkdir_op(struct mnt_idmap *idmap, struct inode *dir,
+		 struct dentry *dentry, umode_t mode)
+{
+	return mfs_mkdir_op_impl(idmap, dir, dentry, mode);
+}
+#endif
 
 int mfs_rmdir_op(struct inode *dir, struct dentry *dentry)
 {

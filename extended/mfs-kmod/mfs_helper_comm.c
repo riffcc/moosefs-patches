@@ -1,13 +1,15 @@
 #include "mfs.h"
 
-#include <linux/miscdevice.h>
-#include <linux/uaccess.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
 #include <linux/poll.h>
+#include <linux/uaccess.h>
+#include <linux/xarray.h>
 
 struct mfs_pending_req {
 	struct list_head tx_node;
-	struct list_head inflight_node;
 	struct completion done;
+	struct kref refcount;
 	u32 req_id;
 	u16 op;
 	void *payload;
@@ -19,27 +21,55 @@ struct mfs_pending_req {
 };
 
 static LIST_HEAD(mfs_tx_queue);
-static LIST_HEAD(mfs_inflight);
+static DEFINE_XARRAY(mfs_inflight);
 static DEFINE_MUTEX(mfs_ctrl_lock);
 static DECLARE_WAIT_QUEUE_HEAD(mfs_ctrl_wq);
 static atomic_t mfs_next_req = ATOMIC_INIT(1);
 static int mfs_helper_openers;
+static dev_t mfs_ctrl_devt;
+static struct cdev mfs_ctrl_cdev;
+static bool mfs_ctrl_cdev_added;
+static struct class *mfs_ctrl_class;
+
+static void mfs_pending_req_release(struct kref *ref)
+{
+	struct mfs_pending_req *req =
+		container_of(ref, struct mfs_pending_req, refcount);
+
+	kfree(req->resp);
+	kfree(req->payload);
+	kfree(req);
+}
+
+static void mfs_pending_req_get(struct mfs_pending_req *req)
+{
+	kref_get(&req->refcount);
+}
+
+static void mfs_pending_req_put(struct mfs_pending_req *req)
+{
+	kref_put(&req->refcount, mfs_pending_req_release);
+}
 
 static void mfs_fail_all_locked(s32 status)
 {
 	struct mfs_pending_req *req;
-	struct mfs_pending_req *tmp;
+	unsigned long index;
 
-	list_for_each_entry_safe(req, tmp, &mfs_inflight, inflight_node) {
+	xa_for_each(&mfs_inflight, index, req) {
+		/* Keep the request alive while we drop the inflight ownership ref. */
+		mfs_pending_req_get(req);
 		if (!list_empty(&req->tx_node))
 			list_del_init(&req->tx_node);
-		list_del_init(&req->inflight_node);
+		xa_erase(&mfs_inflight, index);
 		kfree(req->resp);
 		req->resp = NULL;
 		req->resp_len = 0;
 		req->status = status;
 		req->done_flag = true;
 		complete_all(&req->done);
+		mfs_pending_req_put(req);
+		mfs_pending_req_put(req);
 	}
 }
 
@@ -51,17 +81,6 @@ bool mfs_helper_is_online(void)
 	online = mfs_helper_openers > 0;
 	mutex_unlock(&mfs_ctrl_lock);
 	return online;
-}
-
-static struct mfs_pending_req *mfs_find_inflight_locked(u32 req_id)
-{
-	struct mfs_pending_req *req;
-
-	list_for_each_entry(req, &mfs_inflight, inflight_node) {
-		if (req->req_id == req_id)
-			return req;
-	}
-	return NULL;
 }
 
 int mfs_helper_call(u16 op, const void *req_data, u32 req_len,
@@ -93,8 +112,8 @@ int mfs_helper_call(u16 op, const void *req_data, u32 req_len,
 		}
 	}
 	INIT_LIST_HEAD(&req->tx_node);
-	INIT_LIST_HEAD(&req->inflight_node);
 	init_completion(&req->done);
+	kref_init(&req->refcount);
 	req->op = op;
 	req->payload_len = req_len;
 	req->req_id = (u32)atomic_inc_return(&mfs_next_req);
@@ -106,27 +125,52 @@ int mfs_helper_call(u16 op, const void *req_data, u32 req_len,
 		goto out;
 	}
 	list_add_tail(&req->tx_node, &mfs_tx_queue);
-	list_add_tail(&req->inflight_node, &mfs_inflight);
+	mfs_pending_req_get(req);
+	ret = xa_err(xa_store(&mfs_inflight, req->req_id, req, GFP_KERNEL));
+	if (ret) {
+		mfs_pending_req_put(req);
+		list_del_init(&req->tx_node);
+		mutex_unlock(&mfs_ctrl_lock);
+		goto out;
+	}
 	mutex_unlock(&mfs_ctrl_lock);
 
 	wake_up_interruptible(&mfs_ctrl_wq);
 
 	left = wait_for_completion_interruptible_timeout(&req->done, timeout);
 	if (left == 0) {
+		bool dropped_inflight = false;
+
 		mutex_lock(&mfs_ctrl_lock);
 		if (!req->done_flag) {
 			if (!list_empty(&req->tx_node))
 				list_del_init(&req->tx_node);
-			if (!list_empty(&req->inflight_node))
-				list_del_init(&req->inflight_node);
+			xa_erase(&mfs_inflight, req->req_id);
+			dropped_inflight = true;
 			req->status = -ETIMEDOUT;
 			req->done_flag = true;
 		}
 		mutex_unlock(&mfs_ctrl_lock);
+		if (dropped_inflight)
+			mfs_pending_req_put(req);
 		ret = -ETIMEDOUT;
 		goto out;
 	}
 	if (left < 0) {
+		bool dropped_inflight = false;
+
+		mutex_lock(&mfs_ctrl_lock);
+		if (!req->done_flag) {
+			if (!list_empty(&req->tx_node))
+				list_del_init(&req->tx_node);
+			xa_erase(&mfs_inflight, req->req_id);
+			dropped_inflight = true;
+			req->status = (s32)left;
+			req->done_flag = true;
+		}
+		mutex_unlock(&mfs_ctrl_lock);
+		if (dropped_inflight)
+			mfs_pending_req_put(req);
 		ret = (int)left;
 		goto out;
 	}
@@ -137,9 +181,7 @@ int mfs_helper_call(u16 op, const void *req_data, u32 req_len,
 	req->resp = NULL;
 
 out:
-	kfree(req->resp);
-	kfree(req->payload);
-	kfree(req);
+	mfs_pending_req_put(req);
 	return ret;
 }
 
@@ -173,8 +215,10 @@ retry:
 	}
 
 	req = list_first_entry(&mfs_tx_queue, struct mfs_pending_req, tx_node);
+	mfs_pending_req_get(req);
 	total = sizeof(hdr) + req->payload_len;
 	if (count < total) {
+		mfs_pending_req_put(req);
 		mutex_unlock(&mfs_ctrl_lock);
 		return -EMSGSIZE;
 	}
@@ -191,11 +235,15 @@ retry:
 	hdr.payload_len = req->payload_len;
 
 	if (copy_to_user(buf, &hdr, sizeof(hdr)))
-		return -EFAULT;
-	if (req->payload_len && copy_to_user(buf + sizeof(hdr), req->payload, req->payload_len))
-		return -EFAULT;
+		err = -EFAULT;
+	else if (req->payload_len &&
+		 copy_to_user(buf + sizeof(hdr), req->payload, req->payload_len))
+		err = -EFAULT;
+	else
+		err = (int)total;
 
-	return total;
+	mfs_pending_req_put(req);
+	return err;
 }
 
 static ssize_t mfs_ctrl_write(struct file *file, const char __user *buf,
@@ -228,7 +276,7 @@ static ssize_t mfs_ctrl_write(struct file *file, const char __user *buf,
 	}
 
 	mutex_lock(&mfs_ctrl_lock);
-	req = mfs_find_inflight_locked(hdr.req_id);
+	req = xa_load(&mfs_inflight, hdr.req_id);
 	if (!req) {
 		mutex_unlock(&mfs_ctrl_lock);
 		kfree(payload);
@@ -237,7 +285,7 @@ static ssize_t mfs_ctrl_write(struct file *file, const char __user *buf,
 
 	if (!list_empty(&req->tx_node))
 		list_del_init(&req->tx_node);
-	list_del_init(&req->inflight_node);
+	xa_erase(&mfs_inflight, hdr.req_id);
 	kfree(req->resp);
 	req->resp = payload;
 	req->resp_len = hdr.payload_len;
@@ -245,6 +293,7 @@ static ssize_t mfs_ctrl_write(struct file *file, const char __user *buf,
 	req->done_flag = true;
 	complete_all(&req->done);
 	mutex_unlock(&mfs_ctrl_lock);
+	mfs_pending_req_put(req);
 
 	return count;
 }
@@ -300,25 +349,81 @@ static const struct file_operations mfs_ctrl_fops = {
 	.poll = mfs_ctrl_poll,
 	.open = mfs_ctrl_open,
 	.release = mfs_ctrl_release,
+	/* no_llseek removed in 6.12; noop_llseek available in all targets */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+	.llseek = noop_llseek,
+#else
 	.llseek = no_llseek,
-};
-
-static struct miscdevice mfs_ctrl_miscdev = {
-	.minor = MISC_DYNAMIC_MINOR,
-	.name = MFS_CTRL_DEV_NAME,
-	.fops = &mfs_ctrl_fops,
-	.mode = 0600,
+#endif
 };
 
 int mfs_helper_comm_init(void)
 {
+	int ret;
+	struct device *dev;
+
 	atomic_set(&mfs_next_req, 1);
-	return misc_register(&mfs_ctrl_miscdev);
+	mfs_ctrl_devt = 0;
+	mfs_ctrl_cdev_added = false;
+
+	ret = alloc_chrdev_region(&mfs_ctrl_devt, 0, 1, MFS_CTRL_DEV_NAME);
+	if (ret < 0)
+		return ret;
+
+	cdev_init(&mfs_ctrl_cdev, &mfs_ctrl_fops);
+	mfs_ctrl_cdev.owner = THIS_MODULE;
+	ret = cdev_add(&mfs_ctrl_cdev, mfs_ctrl_devt, 1);
+	if (ret < 0)
+		goto err_chrdev;
+	mfs_ctrl_cdev_added = true;
+
+	mfs_ctrl_class = class_create("mfs");
+	if (IS_ERR(mfs_ctrl_class)) {
+		ret = PTR_ERR(mfs_ctrl_class);
+		mfs_ctrl_class = NULL;
+		goto err_cdev;
+	}
+
+	dev = device_create(mfs_ctrl_class, NULL, mfs_ctrl_devt, NULL,
+			    MFS_CTRL_DEV_NAME);
+	if (IS_ERR(dev)) {
+		ret = PTR_ERR(dev);
+		goto err_class;
+	}
+
+	return 0;
+
+err_class:
+	class_destroy(mfs_ctrl_class);
+	mfs_ctrl_class = NULL;
+err_cdev:
+	if (mfs_ctrl_cdev_added) {
+		cdev_del(&mfs_ctrl_cdev);
+		mfs_ctrl_cdev_added = false;
+	}
+err_chrdev:
+	if (mfs_ctrl_devt) {
+		unregister_chrdev_region(mfs_ctrl_devt, 1);
+		mfs_ctrl_devt = 0;
+	}
+	return ret;
 }
 
 void mfs_helper_comm_exit(void)
 {
-	misc_deregister(&mfs_ctrl_miscdev);
+	if (mfs_ctrl_class) {
+		device_destroy(mfs_ctrl_class, mfs_ctrl_devt);
+		class_destroy(mfs_ctrl_class);
+		mfs_ctrl_class = NULL;
+	}
+	if (mfs_ctrl_cdev_added) {
+		cdev_del(&mfs_ctrl_cdev);
+		mfs_ctrl_cdev_added = false;
+	}
+	if (mfs_ctrl_devt) {
+		unregister_chrdev_region(mfs_ctrl_devt, 1);
+		mfs_ctrl_devt = 0;
+	}
 	mutex_lock(&mfs_ctrl_lock);
 	mfs_fail_all_locked(-ESHUTDOWN);
 	mfs_helper_openers = 0;

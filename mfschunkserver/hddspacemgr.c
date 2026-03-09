@@ -44,6 +44,7 @@
 #endif
 
 #include "MFSCommunication.h"
+#include "hddspacemgr.h"
 #include "cfg.h"
 #include "datapack.h"
 #include "crc.h"

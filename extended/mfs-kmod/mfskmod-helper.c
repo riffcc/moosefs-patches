@@ -168,6 +168,8 @@ struct read_state {
 	uint64_t stripe_band;
 	uint32_t stripe_base_chunk;
 	uint32_t stripe_chunk_count;
+	uint32_t stripe_plan_next_slot;
+	bool stripe_plan_complete;
 	struct read_stripe_meta_entry stripe_meta[HELPER_READ_STRIPE_META_MAX];
 };
 
@@ -579,6 +581,8 @@ static void read_state_reset_stripe(struct read_state *rs)
 	rs->stripe_band = 0;
 	rs->stripe_base_chunk = 0;
 	rs->stripe_chunk_count = 0;
+	rs->stripe_plan_next_slot = 0;
+	rs->stripe_plan_complete = false;
 	memset(rs->stripe_meta, 0, sizeof(rs->stripe_meta));
 }
 
@@ -3713,6 +3717,8 @@ static void read_state_prepare_stripe(struct read_state *rs,
 	rs->stripe_band = band;
 	rs->stripe_base_chunk = base;
 	rs->stripe_chunk_count = chunks_per_band;
+	rs->stripe_plan_next_slot = 0;
+	rs->stripe_plan_complete = false;
 	vlog("read_stripe: inode=%u band=%llu base_chunk=%u chunk_count=%u focus_chunk=%u",
 	     inode, (unsigned long long)band, base, chunks_per_band, chunk_idx);
 }
@@ -3814,33 +3820,79 @@ static int read_state_fetch_one_chunk_meta(struct helper_session *s,
 
 static void read_state_fill_stripe_plan(struct helper_session *s,
 					struct read_state *rs,
-					uint32_t inode,
-					uint32_t chunk_idx)
+					uint32_t inode)
 {
 	struct chunk_meta meta;
-	uint32_t first_slot;
 	uint32_t max_slot;
-	uint32_t i;
 
-	read_state_prepare_stripe(rs, inode, chunk_idx);
-	if (chunk_idx < rs->stripe_base_chunk)
+	if (rs->stripe_chunk_count == 0)
 		return;
-	first_slot = chunk_idx - rs->stripe_base_chunk;
-	max_slot = first_slot + HELPER_READ_STRIPE_FILL_CREDITS;
-	if (max_slot > rs->stripe_chunk_count)
-		max_slot = rs->stripe_chunk_count;
+	max_slot = rs->stripe_chunk_count;
 	if (max_slot > HELPER_READ_STRIPE_META_MAX)
 		max_slot = HELPER_READ_STRIPE_META_MAX;
-	for (i = first_slot; i < max_slot; i++) {
+	while (rs->stripe_plan_next_slot < max_slot) {
+		uint32_t i = rs->stripe_plan_next_slot;
 		uint32_t stripe_chunk_idx = rs->stripe_base_chunk + i;
 		struct read_stripe_meta_entry *ent = &rs->stripe_meta[i];
 
-		if (ent->valid && ent->chunk_idx == stripe_chunk_idx)
+		if (ent->valid && ent->chunk_idx == stripe_chunk_idx) {
+			rs->stripe_plan_next_slot++;
 			continue;
-		if (read_state_fetch_one_chunk_meta(s, rs, inode, stripe_chunk_idx, &meta) &&
-		    stripe_chunk_idx == chunk_idx)
+		}
+		if (read_state_fetch_one_chunk_meta(s, rs, inode, stripe_chunk_idx, &meta))
 			break;
+		rs->stripe_plan_next_slot++;
 	}
+	if (rs->stripe_plan_next_slot >= max_slot)
+		rs->stripe_plan_complete = true;
+}
+
+static int read_state_reconcile_stripe_slot(struct helper_session *s,
+					    struct read_state *rs,
+					    uint32_t inode,
+					    uint32_t chunk_idx,
+					    struct chunk_meta *m,
+					    int *status_out)
+{
+	uint32_t max_slot;
+	uint32_t focus_slot;
+	uint32_t pass;
+
+	if (rs->stripe_chunk_count == 0 || chunk_idx < rs->stripe_base_chunk)
+		return -EINVAL;
+	max_slot = rs->stripe_chunk_count;
+	if (max_slot > HELPER_READ_STRIPE_META_MAX)
+		max_slot = HELPER_READ_STRIPE_META_MAX;
+	focus_slot = chunk_idx - rs->stripe_base_chunk;
+	if (focus_slot >= max_slot)
+		return -EINVAL;
+
+	for (pass = 0; pass < 2; pass++) {
+		uint32_t start = pass == 0 ? focus_slot : 0;
+		uint32_t end = pass == 0 ? max_slot : focus_slot;
+		uint32_t i;
+
+		for (i = start; i < end; i++) {
+			uint32_t stripe_chunk_idx = rs->stripe_base_chunk + i;
+			struct read_stripe_meta_entry *ent = &rs->stripe_meta[i];
+			struct chunk_meta meta;
+			int ret;
+
+			if (ent->valid && ent->chunk_idx == stripe_chunk_idx)
+				continue;
+			ret = read_state_fetch_one_chunk_meta(s, rs, inode,
+							      stripe_chunk_idx, &meta);
+			if (stripe_chunk_idx == chunk_idx && ret)
+				return ret;
+			if (stripe_chunk_idx == chunk_idx &&
+			    read_state_lookup_stripe_meta(rs, inode, chunk_idx, m, status_out))
+				return *status_out;
+		}
+	}
+
+	if (read_state_lookup_stripe_meta(rs, inode, chunk_idx, m, status_out))
+		return *status_out;
+	return -ENOENT;
 }
 
 static int read_state_get_chunk_meta(struct helper_session *s,
@@ -3863,12 +3915,18 @@ static int read_state_get_chunk_meta(struct helper_session *s,
 	}
 
 	read_state_reset_scoreboard(rs);
+	read_state_prepare_stripe(rs, inode, chunk_idx);
+	if (!rs->stripe_plan_complete)
+		read_state_fill_stripe_plan(s, rs, inode);
 	if (read_state_lookup_stripe_meta(rs, inode, chunk_idx, m, &cached_status)) {
 		ret = cached_status;
 	} else {
-		ret = read_state_fetch_one_chunk_meta(s, rs, inode, chunk_idx, m);
-		if (!ret)
-			read_state_fill_stripe_plan(s, rs, inode, chunk_idx);
+		ret = read_state_reconcile_stripe_slot(s, rs, inode, chunk_idx, m,
+						       &cached_status);
+		if (ret == -ENOENT)
+			ret = read_state_fetch_one_chunk_meta(s, rs, inode, chunk_idx, m);
+		else if (!ret)
+			ret = cached_status;
 	}
 
 	rs->meta_valid = true;

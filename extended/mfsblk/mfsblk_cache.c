@@ -106,6 +106,20 @@ void mfsblk_cache_invalidate_chunk(struct mfsblk_dev *dev, u64 chunk_index)
 	mutex_unlock(&dev->cache_lock);
 }
 
+void mfsblk_cache_invalidate_all(struct mfsblk_dev *dev)
+{
+	struct mfsblk_chunk_cache_entry *entry;
+	struct hlist_node *tmp;
+	int bkt;
+
+	mutex_lock(&dev->cache_lock);
+	hash_for_each_safe(dev->chunk_cache, bkt, tmp, entry, node) {
+		hash_del(&entry->node);
+		kfree(entry);
+	}
+	mutex_unlock(&dev->cache_lock);
+}
+
 int mfsblk_cache_get_chunk(struct mfsblk_dev *dev, u64 chunk_index, bool write,
 			 struct mfsblk_chunk_desc *out)
 {

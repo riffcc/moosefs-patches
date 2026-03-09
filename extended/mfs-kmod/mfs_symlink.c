@@ -19,6 +19,9 @@ static int mfs_call_checked(u16 op, const void *req, u32 req_len,
 	return ret;
 }
 
+/*
+ * symlink operation - always returns int in 6.18 and earlier
+ */
 int mfs_symlink_op(struct mnt_idmap *idmap, struct inode *dir,
 		   struct dentry *dentry, const char *symname)
 {

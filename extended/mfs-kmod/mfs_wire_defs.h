@@ -16,6 +16,12 @@
 #define MFSBLOCKSIZE     0x10000U      /* 64 KiB */
 #define MFSCRCEMPTY      0xD7978EEBU
 
+/* ── ANY <-> ANY control packets ────────────────────────────────── */
+#define ANTOAN_NOP                0
+#define ANTOAN_UNKNOWN_COMMAND    1
+#define ANTOAN_BAD_COMMAND_SIZE   2
+#define ANTOAN_FORCE_TIMEOUT      5
+
 #define MFS_ROOT_ID     1U
 #define MFS_NAME_MAX    255U
 #define MFS_SYMLINK_MAX 4096U
@@ -233,12 +239,13 @@
 #define MFS_ERROR_MAX              64
 
 /* ── SETATTR bitmask flags (setmask byte on the wire) ──────────── */
-#define SET_MODE_FLAG         0x01
-#define SET_UID_FLAG          0x02
-#define SET_GID_FLAG          0x04
-#define SET_MTIME_FLAG        0x08
-#define SET_ATIME_FLAG        0x10
-#define SET_MTIME_NOW_FLAG    0x40
+#define SET_WINATTR_FLAG      0x01
+#define SET_MODE_FLAG         0x02
+#define SET_UID_FLAG          0x04
+#define SET_GID_FLAG          0x08
+#define SET_MTIME_NOW_FLAG    0x10
+#define SET_MTIME_FLAG        0x20
+#define SET_ATIME_FLAG        0x40
 #define SET_ATIME_NOW_FLAG    0x80
 
 /* ── Rename mode flags ─────────────────────────────────────────── */
@@ -255,12 +262,19 @@
 /* ── Default ports ────────────────────────────────────────────── */
 #define MFS_DEFAULT_MASTER_PORT 9421
 
-/* ── FUSE register blob ────────────────────────────────────────── */
-static const unsigned char FUSE_REGISTER_BLOB_NOACL[64] = {
-	'k','F','h','9','m','d','Z','s','R','8','4','l','5','e','6','7',
-	'5','v','8','b','i','5','4','V','f','X','a','X','S','Y','o','z',
-	'a','U','3','D','S','z','9','i','C','B','y','E','L','h','F','T',
-	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-};
+/* ── FUSE register blobs ────────────────────────────────────────── */
+/* ACL blob - required for modern MooseFS (CE and Pro) */
+static const unsigned char FUSE_REGISTER_BLOB_ACL[64] =
+	"DjI1GAQDULI5d2YjA26ypc3ovkhjvhciTQVx3CS4nYgtBoUcsljiVpsErJENHaw0";
+
+/* NOACL blob - for compatibility with very old masters */
+static const unsigned char FUSE_REGISTER_BLOB_NOACL[64] =
+	"kFh9mdZsR84l5e675v8bi54VfXaXSYozaU3DSz9AsLLtOtKipzb9aQNkxeOISx64";
+
+/* ── Version encoding for registration ──────────────────────────── */
+/* MooseFS 4.58.3 */
+#define MFS_VERSMAJ 4
+#define MFS_VERSMID 58
+#define MFS_VERSMIN 3
 
 #endif /* _MFS_WIRE_DEFS_H_ */

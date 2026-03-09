@@ -3,7 +3,6 @@
 #include <linux/idr.h>
 #include <linux/in.h>
 #include <linux/inet.h>
-#include <linux/jhash.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/module.h>
@@ -125,7 +124,6 @@ static int mfsblk_parse_spec(char *spec_str, struct mfsblk_map_spec *spec)
 	char *item;
 	bool have_master = false;
 	bool have_path = false;
-	bool have_size = false;
 	int ret;
 
 	memset(spec, 0, sizeof(*spec));
@@ -157,11 +155,13 @@ static int mfsblk_parse_spec(char *spec_str, struct mfsblk_map_spec *spec)
 				return -EINVAL;
 			strscpy(spec->image_path, value, sizeof(spec->image_path));
 			have_path = true;
+		} else if (!strcmp(key, "password")) {
+			strscpy(spec->password, value, sizeof(spec->password));
 		} else if (!strcmp(key, "size")) {
 			ret = mfsblk_parse_size(value, &spec->size_bytes);
 			if (ret)
 				return ret;
-			have_size = true;
+			spec->size_explicit = true;
 		} else if (!strcmp(key, "inode")) {
 			ret = kstrtou32(value, 10, &spec->inode);
 			if (ret)
@@ -172,11 +172,8 @@ static int mfsblk_parse_spec(char *spec_str, struct mfsblk_map_spec *spec)
 		}
 	}
 
-	if (!have_master || !have_path || !have_size)
+	if (!have_master || !have_path)
 		return -EINVAL;
-
-	if (!spec->inode_explicit)
-		spec->inode = jhash(spec->image_path, strlen(spec->image_path), 0x4d465342U);
 
 	return 0;
 }
@@ -208,19 +205,26 @@ static int mfsblk_add_one(char *spec_str)
 	return 0;
 }
 
-static int mfsblk_remove_one(const char *name)
+static struct mfsblk_dev *mfsblk_find_one(const char *name)
 {
 	struct mfsblk_dev *dev;
+
+	list_for_each_entry(dev, &mfsblk_devices, list) {
+		if (!strcmp(dev->name, name))
+			return dev;
+	}
+
+	return NULL;
+}
+
+static int mfsblk_remove_one(const char *name)
+{
 	struct mfsblk_dev *found = NULL;
 
 	mutex_lock(&mfsblk_devices_lock);
-	list_for_each_entry(dev, &mfsblk_devices, list) {
-		if (!strcmp(dev->name, name)) {
-			list_del(&dev->list);
-			found = dev;
-			break;
-		}
-	}
+	found = mfsblk_find_one(name);
+	if (found)
+		list_del(&found->list);
 	mutex_unlock(&mfsblk_devices_lock);
 
 	if (!found)
@@ -228,6 +232,90 @@ static int mfsblk_remove_one(const char *name)
 
 	ida_free(&mfsblk_ids, found->id);
 	mfsblk_dev_destroy(found);
+	return 0;
+}
+
+static int mfsblk_resize_one(const char *name)
+{
+	struct mfsblk_dev *found = NULL;
+	int ret;
+
+	mutex_lock(&mfsblk_devices_lock);
+	found = mfsblk_find_one(name);
+	mutex_unlock(&mfsblk_devices_lock);
+
+	if (!found)
+		return -ENOENT;
+
+	ret = mfsblk_dev_resize(found);
+	return ret;
+}
+
+static int mfsblk_set_size_one(const char *name, u64 size_bytes)
+{
+	struct mfsblk_dev *found = NULL;
+	int ret;
+
+	mutex_lock(&mfsblk_devices_lock);
+	found = mfsblk_find_one(name);
+	mutex_unlock(&mfsblk_devices_lock);
+
+	if (!found)
+		return -ENOENT;
+
+	ret = mfsblk_dev_set_size(found, size_bytes);
+	return ret;
+}
+
+static int mfsblk_parse_resize_spec(char *spec_str, char **name, u64 *size_bytes)
+{
+	char *cursor = spec_str;
+	char *item;
+	bool have_name = false;
+	bool have_size = false;
+	int ret;
+
+	*name = NULL;
+	*size_bytes = 0;
+
+	while ((item = strsep(&cursor, ",")) != NULL) {
+		char *key;
+		char *value;
+
+		item = strim(item);
+		if (!*item)
+			continue;
+
+		if (!have_name && !strchr(item, '=')) {
+			*name = item;
+			have_name = true;
+			continue;
+		}
+
+		key = item;
+		value = strchr(item, '=');
+		if (!value)
+			return -EINVAL;
+		*value = '\0';
+		value = strim(value + 1);
+		key = strim(key);
+
+		if (!strcmp(key, "name")) {
+			*name = value;
+			have_name = true;
+		} else if (!strcmp(key, "size")) {
+			ret = mfsblk_parse_size(value, size_bytes);
+			if (ret)
+				return ret;
+			have_size = true;
+		} else {
+			return -EINVAL;
+		}
+	}
+
+	if (!have_name || !have_size || !*name || !**name)
+		return -EINVAL;
+
 	return 0;
 }
 
@@ -271,8 +359,55 @@ static ssize_t remove_store(const struct bus_type *bus, const char *buf, size_t 
 	return count;
 }
 
+static ssize_t resize_store(const struct bus_type *bus, const char *buf, size_t count)
+{
+	char *name;
+	int ret;
+
+	(void)bus;
+
+	name = kstrndup(buf, count, GFP_KERNEL);
+	if (!name)
+		return -ENOMEM;
+	strim(name);
+
+	ret = mfsblk_resize_one(name);
+	kfree(name);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static ssize_t setsize_store(const struct bus_type *bus, const char *buf,
+			     size_t count)
+{
+	char *spec;
+	char *name;
+	u64 size_bytes;
+	int ret;
+
+	(void)bus;
+
+	spec = kstrndup(buf, count, GFP_KERNEL);
+	if (!spec)
+		return -ENOMEM;
+	strim(spec);
+
+	ret = mfsblk_parse_resize_spec(spec, &name, &size_bytes);
+	if (!ret)
+		ret = mfsblk_set_size_one(name, size_bytes);
+	kfree(spec);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
 static BUS_ATTR_WO(add);
 static BUS_ATTR_WO(remove);
+static BUS_ATTR_WO(resize);
+static BUS_ATTR_WO(setsize);
 
 static int __init mfsblk_init(void)
 {
@@ -294,9 +429,21 @@ static int __init mfsblk_init(void)
 	if (ret)
 		goto err_add;
 
+	ret = bus_create_file(&mfsblk_bus_type, &bus_attr_resize);
+	if (ret)
+		goto err_remove;
+
+	ret = bus_create_file(&mfsblk_bus_type, &bus_attr_setsize);
+	if (ret)
+		goto err_resize;
+
 	pr_info("mfsblk: loaded\n");
 	return 0;
 
+err_resize:
+	bus_remove_file(&mfsblk_bus_type, &bus_attr_resize);
+err_remove:
+	bus_remove_file(&mfsblk_bus_type, &bus_attr_remove);
 err_add:
 	bus_remove_file(&mfsblk_bus_type, &bus_attr_add);
 err_bus:
@@ -311,6 +458,8 @@ static void __exit mfsblk_exit(void)
 	struct mfsblk_dev *dev;
 	struct mfsblk_dev *tmp;
 
+	bus_remove_file(&mfsblk_bus_type, &bus_attr_setsize);
+	bus_remove_file(&mfsblk_bus_type, &bus_attr_resize);
 	bus_remove_file(&mfsblk_bus_type, &bus_attr_remove);
 	bus_remove_file(&mfsblk_bus_type, &bus_attr_add);
 

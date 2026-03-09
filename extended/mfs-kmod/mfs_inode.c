@@ -60,6 +60,7 @@ struct inode *mfs_alloc_inode(struct super_block *sb)
 		return NULL;
 	memset(mi, 0, sizeof(*mi));
 	spin_lock_init(&mi->lock);
+	mfs_inode_async_init(mi);
 	inode_init_once(&mi->vfs_inode);
 	return &mi->vfs_inode;
 }
@@ -220,6 +221,9 @@ static struct dentry *mfs_lookup(struct inode *dir, struct dentry *dentry,
 	return d_splice_alias(inode, dentry);
 }
 
+/*
+ * create operation - always returns int in 6.18 and earlier
+ */
 static int mfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		      struct dentry *dentry, umode_t mode, bool excl)
 {
@@ -507,6 +511,7 @@ int mfs_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 void mfs_evict_inode(struct inode *inode)
 {
+	mfs_inode_async_destroy(MFS_I(inode));
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
 	mfs_cache_purge_inode(&MFS_SB(inode->i_sb)->chunk_cache, inode->i_ino);
