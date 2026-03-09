@@ -48,6 +48,9 @@ typedef struct BDRVMFSState {
     char *path;
     uint64_t inode;
     int64_t size;
+    uint32_t master_version;
+    bool has_password;
+    uint8_t password_md5[16];
 
     MFSConnPool conns;
 
@@ -100,6 +103,56 @@ static int mfs_parse_size(const char *s, uint64_t *out)
 
     *out = val * mult;
     return 0;
+}
+
+static int mfs_parse_md5_hex(const char *hex, uint8_t out[16])
+{
+    int i;
+
+    if (!hex || strlen(hex) != 32) {
+        return -EINVAL;
+    }
+
+    for (i = 0; i < 16; i++) {
+        char hi = hex[i * 2];
+        char lo = hex[i * 2 + 1];
+        int hi_v;
+        int lo_v;
+
+        if (hi >= '0' && hi <= '9') {
+            hi_v = hi - '0';
+        } else if (hi >= 'a' && hi <= 'f') {
+            hi_v = hi - 'a' + 10;
+        } else if (hi >= 'A' && hi <= 'F') {
+            hi_v = hi - 'A' + 10;
+        } else {
+            return -EINVAL;
+        }
+
+        if (lo >= '0' && lo <= '9') {
+            lo_v = lo - '0';
+        } else if (lo >= 'a' && lo <= 'f') {
+            lo_v = lo - 'a' + 10;
+        } else if (lo >= 'A' && lo <= 'F') {
+            lo_v = lo - 'A' + 10;
+        } else {
+            return -EINVAL;
+        }
+
+        out[i] = (hi_v << 4) | lo_v;
+    }
+
+    return 0;
+}
+
+static void mfs_hash_password(const char *password, uint8_t out[16])
+{
+    GChecksum *sum = g_checksum_new(G_CHECKSUM_MD5);
+    gsize digest_len = 16;
+
+    g_checksum_update(sum, (const guchar *)password, strlen(password));
+    g_checksum_get_digest(sum, out, &digest_len);
+    g_checksum_free(sum);
 }
 
 static void mfs_chunk_cache_entry_free(gpointer data)
@@ -155,7 +208,9 @@ static int mfs_master_register(BDRVMFSState *s, Error **errp)
         return fd;
     }
 
-    ret = mfs_proto_register_tools(fd, "qemu-mfs", errp);
+    ret = mfs_proto_register_session(fd, "qemu-mfs",
+                                     s->has_password ? s->password_md5 : NULL,
+                                     &s->master_version, errp);
     if (ret < 0) {
         mfs_conn_mark_dead_locked(master);
     }
@@ -178,7 +233,8 @@ static int mfs_master_lookup(BDRVMFSState *s, Error **errp)
         return fd;
     }
 
-    ret = mfs_proto_master_lookup_path(fd, s->path, &inode, &size, errp);
+    ret = mfs_proto_master_lookup_path(fd, s->master_version, s->path,
+                                       &inode, &size, errp);
     if (ret < 0) {
         mfs_conn_mark_dead_locked(master);
         mfs_conn_unlock(master);
@@ -231,10 +287,12 @@ static int mfs_master_get_chunk(BDRVMFSState *s, uint32_t chunk_index,
         }
 
         if (write) {
-            ret = mfs_proto_master_write_chunk(fd, s->inode, chunk_index,
+            ret = mfs_proto_master_write_chunk(fd, s->master_version,
+                                               s->inode, chunk_index,
                                                &entry->loc, write_id, errp);
         } else {
-            ret = mfs_proto_master_read_chunk(fd, s->inode, chunk_index,
+            ret = mfs_proto_master_read_chunk(fd, s->master_version,
+                                              s->inode, chunk_index,
                                               &entry->loc, errp);
         }
 
@@ -382,6 +440,7 @@ static int mfs_backend_write_locked(BDRVMFSState *s, int64_t offset,
                                     Error **errp)
 {
     uint64_t pos = 0;
+    uint64_t target_size = MAX((uint64_t)s->size, (uint64_t)(offset + bytes));
 
     while (pos < bytes) {
         uint64_t file_off = offset + pos;
@@ -390,11 +449,9 @@ static int mfs_backend_write_locked(BDRVMFSState *s, int64_t offset,
         uint32_t this_len = mfs_min_u64(bytes - pos,
                                         MFS_CHUNK_SIZE - chunk_off);
         MFSChunkCacheEntry *entry;
-        uint64_t write_id = 0;
         int ret;
 
-        ret = mfs_master_get_chunk(s, chunk_index, true, &entry,
-                                   &write_id, errp);
+        ret = mfs_master_get_chunk(s, chunk_index, true, &entry, NULL, errp);
         if (ret < 0) {
             return ret;
         }
@@ -406,8 +463,6 @@ static int mfs_backend_write_locked(BDRVMFSState *s, int64_t offset,
             MFSConn *master = mfs_conn_pool_master(&s->conns);
             int fd;
             int end_ret;
-            uint8_t status = ret < 0 ? 1 : 0;
-
             mfs_conn_lock(master);
             fd = mfs_conn_get_fd_locked(master, errp);
             if (fd < 0) {
@@ -415,12 +470,11 @@ static int mfs_backend_write_locked(BDRVMFSState *s, int64_t offset,
                 return fd;
             }
 
-            end_ret = mfs_proto_master_write_chunk_end(fd, s->inode,
-                                                       chunk_index,
+            end_ret = mfs_proto_master_write_chunk_end(fd, s->master_version,
+                                                       s->inode, chunk_index,
                                                        entry->loc.chunk_id,
-                                                       entry->loc.version,
-                                                       write_id,
-                                                       status,
+                                                       target_size,
+                                                       chunk_off, this_len,
                                                        errp);
             if (end_ret < 0) {
                 mfs_conn_mark_dead_locked(master);
@@ -502,6 +556,8 @@ static int bdrv_mfs_open(BlockDriverState *bs, QDict *options, int flags,
     const char *path;
     const char *size_opt;
     const char *ttl_opt;
+    const char *password_opt;
+    const char *password_md5_opt;
     uint64_t parsed = 0;
     int ret;
 
@@ -511,6 +567,8 @@ static int bdrv_mfs_open(BlockDriverState *bs, QDict *options, int flags,
     path = qdict_get_try_str(options, "path");
     size_opt = qdict_get_try_str(options, "size");
     ttl_opt = qdict_get_try_str(options, "chunk-cache-ttl-ms");
+    password_opt = qdict_get_try_str(options, "password");
+    password_md5_opt = qdict_get_try_str(options, "password-md5");
 
     if (!master || !path) {
         error_setg(errp,
@@ -521,6 +579,25 @@ static int bdrv_mfs_open(BlockDriverState *bs, QDict *options, int flags,
     s->master_endpoint = g_strdup(master);
     s->path = g_strdup(path);
     s->size = 0;
+    s->has_password = false;
+    memset(s->password_md5, 0, sizeof(s->password_md5));
+
+    if (password_opt && password_md5_opt) {
+        error_setg(errp, "mfs: use either password or password-md5, not both");
+        return -EINVAL;
+    }
+
+    if (password_opt && *password_opt) {
+        mfs_hash_password(password_opt, s->password_md5);
+        s->has_password = true;
+    } else if (password_md5_opt && *password_md5_opt) {
+        ret = mfs_parse_md5_hex(password_md5_opt, s->password_md5);
+        if (ret < 0) {
+            error_setg(errp, "mfs: invalid password-md5 value");
+            return ret;
+        }
+        s->has_password = true;
+    }
 
     s->chunk_cache_ttl_ns = MFS_CHUNK_TTL_MS_DEFAULT * 1000LL * 1000LL;
     if (ttl_opt && *ttl_opt) {
@@ -545,6 +622,8 @@ static int bdrv_mfs_open(BlockDriverState *bs, QDict *options, int flags,
     qdict_del(options, "path");
     qdict_del(options, "size");
     qdict_del(options, "chunk-cache-ttl-ms");
+    qdict_del(options, "password");
+    qdict_del(options, "password-md5");
 
     ret = mfs_conn_pool_init(&s->conns, s->master_endpoint,
                              MFS_MASTER_DEFAULT_PORT, errp);
@@ -576,6 +655,30 @@ static int bdrv_mfs_open(BlockDriverState *bs, QDict *options, int flags,
         goto fail;
     }
 
+    {
+        MFSConn *master = mfs_conn_pool_master(&s->conns);
+        int fd;
+        uint8_t open_flags = (flags & BDRV_O_RDWR) ? MFS_OPEN_RDWR
+                                                   : MFS_OPEN_READONLY;
+
+        mfs_conn_lock(master);
+        fd = mfs_conn_get_fd_locked(master, errp);
+        if (fd < 0) {
+            mfs_conn_unlock(master);
+            ret = fd;
+            goto fail;
+        }
+
+        ret = mfs_proto_master_open(fd, s->inode, open_flags, errp);
+        if (ret < 0) {
+            mfs_conn_mark_dead_locked(master);
+            mfs_conn_unlock(master);
+            goto fail;
+        }
+
+        mfs_conn_unlock(master);
+    }
+
     return 0;
 
 fail:
@@ -596,6 +699,8 @@ fail:
     s->master_endpoint = NULL;
     g_free(s->path);
     s->path = NULL;
+    s->has_password = false;
+    memset(s->password_md5, 0, sizeof(s->password_md5));
     return ret;
 }
 
@@ -636,6 +741,8 @@ static void bdrv_mfs_close(BlockDriverState *bs)
 
     g_free(s->path);
     s->path = NULL;
+    s->has_password = false;
+    memset(s->password_md5, 0, sizeof(s->password_md5));
 }
 
 static int coroutine_fn bdrv_mfs_co_preadv(BlockDriverState *bs,
@@ -888,6 +995,9 @@ static int coroutine_fn bdrv_mfs_co_create_opts(BlockDriver *drv,
     uint64_t size;
     MFSConnPool pool;
     uint64_t inode;
+    uint32_t master_version = 0;
+    uint8_t password_md5[16];
+    bool has_password = false;
     int ret;
 
     (void)drv;
@@ -904,6 +1014,30 @@ static int coroutine_fn bdrv_mfs_co_create_opts(BlockDriver *drv,
     if (!path || !*path) {
         error_setg(errp, "mfs create: missing path option");
         return -EINVAL;
+    }
+
+    {
+        const char *password_opt = qemu_opt_get(opts, "password");
+        const char *password_md5_opt = qemu_opt_get(opts, "password-md5");
+
+        memset(password_md5, 0, sizeof(password_md5));
+
+        if (password_opt && *password_opt && password_md5_opt && *password_md5_opt) {
+            error_setg(errp, "mfs create: use either password or password-md5");
+            return -EINVAL;
+        }
+
+        if (password_opt && *password_opt) {
+            mfs_hash_password(password_opt, password_md5);
+            has_password = true;
+        } else if (password_md5_opt && *password_md5_opt) {
+            ret = mfs_parse_md5_hex(password_md5_opt, password_md5);
+            if (ret < 0) {
+                error_setg(errp, "mfs create: invalid password-md5");
+                return ret;
+            }
+            has_password = true;
+        }
     }
 
     size = qemu_opt_get_size_del(opts, BLOCK_OPT_SIZE, 0);
@@ -930,7 +1064,9 @@ static int coroutine_fn bdrv_mfs_co_create_opts(BlockDriver *drv,
             return fd;
         }
 
-        ret = mfs_proto_register_tools(fd, "qemu-mfs-create", errp);
+        ret = mfs_proto_register_session(fd, "qemu-mfs-create",
+                                         has_password ? password_md5 : NULL,
+                                         &master_version, errp);
         if (ret < 0) {
             mfs_conn_mark_dead_locked(master_conn);
             mfs_conn_unlock(master_conn);
@@ -938,7 +1074,8 @@ static int coroutine_fn bdrv_mfs_co_create_opts(BlockDriver *drv,
             return ret;
         }
 
-        ret = mfs_proto_master_create_path(fd, path, size, &inode, errp);
+        ret = mfs_proto_master_create_path(fd, master_version, path, size,
+                                           &inode, errp);
         if (ret < 0) {
             mfs_conn_mark_dead_locked(master_conn);
             mfs_conn_unlock(master_conn);
@@ -967,6 +1104,16 @@ static QemuOptsList mfs_create_opts = {
             .name = "path",
             .type = QEMU_OPT_STRING,
             .help = "MooseFS path for the virtual disk file",
+        },
+        {
+            .name = "password",
+            .type = QEMU_OPT_STRING,
+            .help = "MooseFS master password",
+        },
+        {
+            .name = "password-md5",
+            .type = QEMU_OPT_STRING,
+            .help = "32 hex digits of MD5(password) for MooseFS auth",
         },
         {
             .name = BLOCK_OPT_SIZE,
