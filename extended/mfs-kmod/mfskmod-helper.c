@@ -37,6 +37,7 @@
 #define HELPER_READ_SEQ_TRIGGER (2U * 1024U * 1024U)
 #define HELPER_READ_SCOREBOARD_MAX 32
 #define HELPER_READ_META_CACHE_MAX 64
+#define HELPER_READ_AFFINITY_CACHE_MAX 64
 #define HELPER_READ_FOREGROUND_MAX (4U * 1024U * 1024U)
 #define HELPER_READ_WORKERS 2
 #define HELPER_READ_JOB_QUEUE_MAX 32
@@ -76,6 +77,14 @@ struct read_meta_cache_entry {
 	uint32_t chunk_idx;
 	int status;
 	struct chunk_meta meta;
+	uint64_t stamp;
+};
+
+struct read_affinity_entry {
+	bool valid;
+	uint32_t inode;
+	uint32_t preferred_ip;
+	uint16_t preferred_port;
 	uint64_t stamp;
 };
 
@@ -176,6 +185,8 @@ struct helper_session {
 	uint32_t read_foreground_inflight;
 	uint64_t read_meta_cache_clock;
 	struct read_meta_cache_entry read_meta_cache[HELPER_READ_META_CACHE_MAX];
+	uint64_t read_affinity_clock;
+	struct read_affinity_entry read_affinity_cache[HELPER_READ_AFFINITY_CACHE_MAX];
 	uint64_t read_prefetch_data_clock;
 	struct read_prefetch_request read_prefetch_queue[HELPER_READ_PREFETCH_QUEUE_MAX];
 	struct read_prefetch_data_entry read_prefetch_data[HELPER_READ_PREFETCH_DATA_CACHE_MAX];
@@ -237,6 +248,8 @@ static void session_reset_read_meta_cache(struct helper_session *s)
 	pthread_mutex_lock(&s->read_prefetch_mu);
 	memset(s->read_meta_cache, 0, sizeof(s->read_meta_cache));
 	s->read_meta_cache_clock = 0;
+	memset(s->read_affinity_cache, 0, sizeof(s->read_affinity_cache));
+	s->read_affinity_clock = 0;
 	s->read_foreground_inflight = 0;
 	memset(s->read_prefetch_queue, 0, sizeof(s->read_prefetch_queue));
 	for (i = 0; i < HELPER_READ_PREFETCH_DATA_CACHE_MAX; i++) {
@@ -374,6 +387,65 @@ static bool session_lookup_read_meta_cache(struct helper_session *s,
 	}
 	pthread_mutex_unlock(&s->read_prefetch_mu);
 	return found;
+}
+
+static bool session_lookup_read_affinity(struct helper_session *s,
+					 uint32_t inode,
+					 uint32_t *ip_out,
+					 uint16_t *port_out)
+{
+	bool found = false;
+	size_t i;
+
+	pthread_mutex_lock(&s->read_prefetch_mu);
+	for (i = 0; i < HELPER_READ_AFFINITY_CACHE_MAX; i++) {
+		struct read_affinity_entry *ent = &s->read_affinity_cache[i];
+
+		if (!ent->valid || ent->inode != inode)
+			continue;
+		ent->stamp = ++s->read_affinity_clock;
+		if (ip_out)
+			*ip_out = ent->preferred_ip;
+		if (port_out)
+			*port_out = ent->preferred_port;
+		found = true;
+		break;
+	}
+	pthread_mutex_unlock(&s->read_prefetch_mu);
+	return found;
+}
+
+static void session_store_read_affinity(struct helper_session *s,
+					uint32_t inode,
+					uint32_t preferred_ip,
+					uint16_t preferred_port)
+{
+	struct read_affinity_entry *victim = NULL;
+	size_t i;
+
+	if (!preferred_ip || !preferred_port)
+		return;
+
+	pthread_mutex_lock(&s->read_prefetch_mu);
+	for (i = 0; i < HELPER_READ_AFFINITY_CACHE_MAX; i++) {
+		struct read_affinity_entry *ent = &s->read_affinity_cache[i];
+
+		if (ent->valid && ent->inode == inode) {
+			victim = ent;
+			break;
+		}
+		if (!victim || !victim->valid || ent->stamp < victim->stamp)
+			victim = ent;
+	}
+	if (victim) {
+		memset(victim, 0, sizeof(*victim));
+		victim->valid = true;
+		victim->inode = inode;
+		victim->preferred_ip = preferred_ip;
+		victim->preferred_port = preferred_port;
+		victim->stamp = ++s->read_affinity_clock;
+	}
+	pthread_mutex_unlock(&s->read_prefetch_mu);
 }
 
 static void session_store_read_meta_cache(struct helper_session *s,
@@ -533,6 +605,8 @@ static const struct cs_loc *choose_read_replica(struct helper_session *s,
 {
 	struct chunk_meta future_meta;
 	int future_status = 0;
+	uint32_t session_preferred_ip = 0;
+	uint16_t session_preferred_port = 0;
 	uint32_t best_score = 0;
 	const struct cs_loc *best = NULL;
 	uint32_t i;
@@ -541,6 +615,10 @@ static const struct cs_loc *choose_read_replica(struct helper_session *s,
 
 	if (!m || m->loc_count == 0)
 		return NULL;
+
+	(void)session_lookup_read_affinity(s, inode,
+					       &session_preferred_ip,
+					       &session_preferred_port);
 
 	for (i = 0; i < m->loc_count; i++) {
 		if (rs->cs_fd >= 0 &&
@@ -555,6 +633,9 @@ static const struct cs_loc *choose_read_replica(struct helper_session *s,
 		if (rs->preferred_ip == m->locs[i].ip &&
 		    rs->preferred_port == m->locs[i].port)
 			score += 8;
+		if (session_preferred_ip == m->locs[i].ip &&
+		    session_preferred_port == m->locs[i].port)
+			score += 16;
 
 		for (k = 1; k <= HELPER_READ_REPLICA_LOOKAHEAD; k++) {
 			if (!session_lookup_read_meta_cache(s, inode, chunk_idx + k,
@@ -3293,6 +3374,7 @@ static int read_state_get_cs_fd(struct read_state *rs,
 	rs->cs_port = loc->port;
 	rs->preferred_ip = loc->ip;
 	rs->preferred_port = loc->port;
+	session_store_read_affinity(s, inode, loc->ip, loc->port);
 	return fd;
 }
 
