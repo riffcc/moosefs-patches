@@ -1,6 +1,21 @@
 use std::io::{Cursor, Read, Write};
-use std::net::UdpSocket;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+#[cfg(feature = "quic")]
+use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(feature = "quic")]
+use quinn::crypto::rustls::QuicClientConfig;
+#[cfg(feature = "quic")]
+use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream};
+#[cfg(feature = "quic")]
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+#[cfg(feature = "quic")]
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+#[cfg(feature = "quic")]
+use tokio::io::AsyncWriteExt;
+#[cfg(feature = "quic")]
+use tokio::runtime::{Builder, Runtime};
 
 use crate::error::{Error, Result};
 use crate::protocol::{
@@ -16,6 +31,7 @@ pub struct QuicConnectConfig {
     pub alpn: Vec<u8>,
     pub zero_rtt: bool,
     pub datagrams: bool,
+    pub insecure_skip_verify: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +61,17 @@ pub struct PacketModeMaster {
     next_reqid: u32,
 }
 
+#[cfg(feature = "quic")]
+pub struct QuicStreamMaster {
+    runtime: Runtime,
+    endpoint: Endpoint,
+    connection: Connection,
+    send: SendStream,
+    recv: RecvStream,
+    read_cursor: Cursor<Vec<u8>>,
+    pending_write: Vec<u8>,
+}
+
 impl Default for QuicConnectConfig {
     fn default() -> Self {
         Self {
@@ -52,6 +79,7 @@ impl Default for QuicConnectConfig {
             alpn: b"mfs-direct/exp1".to_vec(),
             zero_rtt: true,
             datagrams: false,
+            insecure_skip_verify: true,
         }
     }
 }
@@ -76,15 +104,22 @@ impl QuicConnectConfig {
         self.datagrams = enabled;
         self
     }
+
+    pub fn with_insecure_skip_verify(mut self, enabled: bool) -> Self {
+        self.insecure_skip_verify = enabled;
+        self
+    }
 }
 
 impl PacketModeMaster {
     pub fn connect(master_addr: &str, config: &QuicConnectConfig) -> Result<(Self, QuicEndpointInfo)> {
         let hello = probe_quic_endpoint(master_addr, config)?;
         if !hello.supports_datagram_mode() {
-            return Err(Error::Unsupported("QUIC endpoint does not advertise MooseFS datagram mode"));
+            return Err(Error::Unsupported(
+                "QUIC endpoint does not advertise MooseFS datagram mode",
+            ));
         }
-        let udp_addr = derive_quic_addr(master_addr)?;
+        let udp_addr = resolve_quic_socket_addr(master_addr)?;
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_read_timeout(Some(Duration::from_secs(2)))?;
         socket.connect(&udp_addr)?;
@@ -118,10 +153,115 @@ impl PacketModeMaster {
     }
 }
 
+#[cfg(feature = "quic")]
+impl QuicStreamMaster {
+    pub fn connect(master_addr: &str, config: &QuicConnectConfig) -> Result<(Self, QuicEndpointInfo)> {
+        let hello = probe_quic_endpoint(master_addr, config)?;
+        if !hello.supports_tls_quic() {
+            return Err(Error::Unsupported(
+                "QUIC endpoint does not advertise native TLS-backed QUIC",
+            ));
+        }
+
+        let udp_addr = resolve_quic_socket_addr(master_addr)?;
+        let server_name = config
+            .server_name
+            .clone()
+            .unwrap_or_else(|| master_host(master_addr).to_string());
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(Error::Io)?;
+        let client_config = build_quic_client_config(config)?;
+        let (endpoint, connection, send, recv) = runtime.block_on(async {
+            let bind_addr: SocketAddr = if udp_addr.is_ipv6() {
+                "[::]:0".parse().expect("literal IPv6 bind address is valid")
+            } else {
+                "0.0.0.0:0".parse().expect("literal IPv4 bind address is valid")
+            };
+            let mut endpoint = Endpoint::client(bind_addr)
+                .map_err(|err| Error::ProtocolDetail(format!("QUIC endpoint bind failed: {err}")))?;
+            endpoint.set_default_client_config(client_config);
+            let connection = endpoint
+                .connect(udp_addr, &server_name)
+                .map_err(|err| Error::ProtocolDetail(format!("QUIC connect setup failed: {err}")))?
+                .await
+                .map_err(|err| Error::ProtocolDetail(format!("QUIC connect failed: {err}")))?;
+            let (send, recv) = connection
+                .open_bi()
+                .await
+                .map_err(|err| Error::ProtocolDetail(format!("QUIC control stream open failed: {err}")))?;
+            Ok::<_, Error>((endpoint, connection, send, recv))
+        })?;
+        Ok((
+            Self {
+                runtime,
+                endpoint,
+                connection,
+                send,
+                recv,
+                read_cursor: Cursor::new(Vec::new()),
+                pending_write: Vec::new(),
+            },
+            hello,
+        ))
+    }
+
+    pub fn endpoint_info(master_addr: &str, config: &QuicConnectConfig) -> Result<QuicEndpointInfo> {
+        probe_quic_endpoint(master_addr, config)
+    }
+
+    fn send_pending(&mut self) -> Result<()> {
+        if self.pending_write.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending_write);
+        self.runtime.block_on(async {
+            self.send
+                .write_all(&pending)
+                .await
+                .map_err(|err| Error::ProtocolDetail(format!("QUIC stream write failed: {err}")))?;
+            self.send
+                .flush()
+                .await
+                .map_err(|err| Error::ProtocolDetail(format!("QUIC stream flush failed: {err}")))?;
+            Ok::<_, Error>(())
+        })
+    }
+
+    fn refill_read_cursor(&mut self) -> Result<()> {
+        if (self.read_cursor.position() as usize) < self.read_cursor.get_ref().len() {
+            return Ok(());
+        }
+        self.send_pending()?;
+        let received = self.runtime.block_on(async {
+            let mut buf = vec![0u8; 8192];
+            let count = self
+                .recv
+                .read(&mut buf)
+                .await
+                .map_err(|err| Error::ProtocolDetail(format!("QUIC stream read failed: {err}")))?;
+            let count = count.ok_or(Error::Protocol("QUIC control stream closed"))?;
+            buf.truncate(count);
+            Ok::<_, Error>(buf)
+        })?;
+        self.read_cursor = Cursor::new(received);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "quic")]
+impl Drop for QuicStreamMaster {
+    fn drop(&mut self) {
+        self.connection.close(0u32.into(), b"done");
+        let _ = self.runtime.block_on(self.endpoint.wait_idle());
+    }
+}
+
 impl Read for PacketModeMaster {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.ensure_response_buffer()
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
         self.read_cursor.read(buf)
     }
 }
@@ -134,6 +274,30 @@ impl Write for PacketModeMaster {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(feature = "quic")]
+impl Read for QuicStreamMaster {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while (self.read_cursor.position() as usize) >= self.read_cursor.get_ref().len() {
+            self.refill_read_cursor()
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+        }
+        self.read_cursor.read(buf)
+    }
+}
+
+#[cfg(feature = "quic")]
+impl Write for QuicStreamMaster {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.pending_write.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.send_pending()
+            .map_err(|err| std::io::Error::other(err.to_string()))
     }
 }
 
@@ -200,6 +364,33 @@ pub fn probe_quic_endpoint(master_addr: &str, config: &QuicConnectConfig) -> Res
     })
 }
 
+#[cfg(feature = "quic")]
+fn build_quic_client_config(config: &QuicConnectConfig) -> Result<ClientConfig> {
+    let crypto = if config.insecure_skip_verify {
+        let mut crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(SkipServerVerification::new())
+            .with_no_client_auth();
+        crypto.alpn_protocols = vec![config.alpn.clone()];
+        crypto.enable_early_data = config.zero_rtt;
+        crypto
+    } else {
+        return Err(Error::Unsupported(
+            "certificate-verified QUIC is not wired yet; use insecure_skip_verify for unstable",
+        ));
+    };
+    let quic_crypto = QuicClientConfig::try_from(crypto)
+        .map_err(|err| Error::ProtocolDetail(format!("QUIC TLS config failed: {err}")))?;
+    Ok(ClientConfig::new(Arc::new(quic_crypto)))
+}
+
+fn resolve_quic_socket_addr(master_addr: &str) -> Result<SocketAddr> {
+    let addr = derive_quic_addr(master_addr)?;
+    addr.to_socket_addrs()?
+        .next()
+        .ok_or(Error::InvalidInput("master_addr did not resolve"))
+}
+
 fn derive_quic_addr(master_addr: &str) -> Result<String> {
     if master_addr.is_empty() {
         return Err(Error::InvalidInput("master_addr must not be empty"));
@@ -213,13 +404,87 @@ fn derive_quic_addr(master_addr: &str) -> Result<String> {
     Ok(format!("{master_addr}:9423"))
 }
 
+#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+fn master_host(master_addr: &str) -> &str {
+    master_addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(master_addr)
+}
+
+#[cfg(feature = "quic")]
+#[derive(Debug)]
+struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
+
+#[cfg(feature = "quic")]
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(Arc::new(rustls::crypto::ring::default_provider())))
+    }
+}
+
+#[cfg(feature = "quic")]
+impl ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::derive_quic_addr;
+    use super::{QuicConnectConfig, derive_quic_addr, master_host};
 
     #[test]
     fn derives_quic_port_from_master_port() {
         assert_eq!(derive_quic_addr("10.7.1.195:19521").unwrap(), "10.7.1.195:19523");
         assert_eq!(derive_quic_addr("mfsmaster").unwrap(), "mfsmaster:9423");
+    }
+
+    #[test]
+    fn default_quic_mode_is_explicitly_insecure_for_unstable() {
+        let config = QuicConnectConfig::default();
+        assert!(config.insecure_skip_verify);
+    }
+
+    #[test]
+    fn host_extraction_reuses_master_hostname() {
+        assert_eq!(master_host("127.0.0.1:19621"), "127.0.0.1");
+        assert_eq!(master_host("mfsmaster"), "mfsmaster");
     }
 }

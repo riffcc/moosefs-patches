@@ -9,8 +9,8 @@ The point is simple:
 - no mount point
 - direct MooseFS protocol access from Rust
 
-This crate should let Rust programs write to MooseFS by speaking the real
-MooseFS master and chunkserver protocols directly.
+This crate lets Rust and C consumers talk to MooseFS directly by speaking the
+real MooseFS master and chunkserver protocols.
 
 ## Why
 
@@ -56,34 +56,65 @@ a real userspace MooseFS client path for:
 - chunk-location decode
 - direct chunkserver reads/writes
 
-## First vertical slice
+## Current Capabilities
 
-The first useful version should implement:
+Today this crate already supports:
 
-1. packet framing
-2. master session registration
-3. absolute-path lookup
-4. leaf-file create under an existing parent directory
-5. open validation
-6. chunk-location lookup for writes
-7. direct chunkserver writes
-8. `WRITE_CHUNK_END` back to the master
-
-That is enough to support:
-
-- `write_all(path, bytes)`
-
-for programs that want to push content directly into MooseFS.
-
-## Non-goals for v1
-
+- packet framing and status/error mapping
+- master session registration and reconnect
+- absolute-path lookup and attribute fetch
 - recursive directory creation
-- full read API polish
-- storage class APIs
-- label-aware placement control
-- full replica-chain forwarding
-- retries/load balancing
-- object-store adapter layer
-- FFI/C ABI
+- file create/open/truncate flows
+- direct chunkserver reads and writes
+- `WRITE_CHUNK_END` commit handling
+- whole-file helpers:
+  - `read_all(path)`
+  - `write_all(path, bytes)`
+- positioned file I/O:
+  - `open_file(path)`
+  - `ensure_file_len(path, size)`
+  - `read_at(file, offset, out)`
+  - `write_at(file, offset, bytes)`
+- file namespace helpers:
+  - `mkdir -p`
+  - exists/stat
+  - unlink/rmdir
+  - rename
+- C ABI exports for userspace integration
 
-Those can all come after the first native userspace write path is real.
+## Current C ABI Shape
+
+The native ABI is aimed at downstream consumers that want MooseFS as a storage
+transport rather than a mounted filesystem.
+
+It currently exposes:
+
+- client connect / destroy
+- whole-file read and write
+- open-or-ensure file handles
+- positioned read and write on open file handles
+- directory creation
+- exists and file-size probes
+- unlink / rmdir / rename
+
+That is enough to start wiring block- or object-oriented consumers without
+forcing every caller to fake local filesystem semantics themselves.
+
+## Still Missing
+
+- retries and replica failover strategy
+- storage class / label-aware placement policy
+- full block-native object layer above positioned I/O
+- live integration coverage against larger real clusters
+- complete QUIC data-path parity
+
+## QUIC Status
+
+There is now an experimental feature-gated QUIC path:
+
+- default build: TCP-only, no extra QUIC dependencies required
+- `--features quic`: enables native QUIC/TLS client experiments and packet-mode
+  helpers
+
+This is still experimental and should not be treated as the stable default
+transport yet.

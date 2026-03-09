@@ -11,6 +11,10 @@ pub struct MfsClientHandle {
     last_error: Option<CString>,
 }
 
+pub struct MfsOpenFileHandle {
+    file: crate::OpenFile,
+}
+
 impl MfsClientHandle {
     fn new(client: Client<TcpStream>) -> Self {
         Self {
@@ -101,6 +105,14 @@ pub extern "C" fn mfs_client_destroy(handle: *mut MfsClientHandle) {
 }
 
 #[no_mangle]
+pub extern "C" fn mfs_file_destroy(handle: *mut MfsOpenFileHandle) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = unsafe { Box::from_raw(handle) };
+}
+
+#[no_mangle]
 pub extern "C" fn mfs_client_last_error(handle: *const MfsClientHandle) -> *const c_char {
     if handle.is_null() {
         return ptr::null();
@@ -110,6 +122,79 @@ pub extern "C" fn mfs_client_last_error(handle: *const MfsClientHandle) -> *cons
         .last_error
         .as_ref()
         .map_or(ptr::null(), |msg| msg.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn mfs_client_open_file(
+    handle: *mut MfsClientHandle,
+    path: *const c_char,
+) -> *mut MfsOpenFileHandle {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return None;
+        }
+        let handle = unsafe { &mut *handle };
+        let path = match cstr_arg(path, "path") {
+            Ok(path) => path,
+            Err(err) => {
+                handle.set_error_message(err);
+                return None;
+            }
+        };
+
+        match handle.client.open_file(path) {
+            Ok(file) => {
+                handle.clear_error();
+                Some(Box::into_raw(Box::new(MfsOpenFileHandle { file })))
+            }
+            Err(err) => {
+                handle.set_error(err);
+                None
+            }
+        }
+    }));
+
+    match result {
+        Ok(Some(file)) => file,
+        _ => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn mfs_client_ensure_file_len(
+    handle: *mut MfsClientHandle,
+    path: *const c_char,
+    size: u64,
+) -> *mut MfsOpenFileHandle {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return None;
+        }
+        let handle = unsafe { &mut *handle };
+        let path = match cstr_arg(path, "path") {
+            Ok(path) => path,
+            Err(err) => {
+                handle.set_error_message(err);
+                return None;
+            }
+        };
+
+        match handle.client.ensure_file_len(path, size) {
+            Ok(file) => {
+                handle.clear_error();
+                Some(Box::into_raw(Box::new(MfsOpenFileHandle { file })))
+            }
+            Err(err) => {
+                handle.set_error(err);
+                None
+            }
+        }
+    }));
+
+    match result {
+        Ok(Some(file)) => file,
+        _ => ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
@@ -142,6 +227,91 @@ pub extern "C" fn mfs_client_write_all(
                 0
             }
             Err(err) => handle.set_error(err),
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn mfs_file_size(handle: *const MfsOpenFileHandle, out_size: *mut u64) -> c_int {
+    ffi_guard(-71, || {
+        if handle.is_null() || out_size.is_null() {
+            return -22;
+        }
+        let handle = unsafe { &*handle };
+        unsafe {
+            *out_size = handle.file.size;
+        }
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn mfs_client_pread(
+    client: *mut MfsClientHandle,
+    file: *const MfsOpenFileHandle,
+    offset: u64,
+    out_data: *mut c_uchar,
+    out_len: usize,
+) -> c_int {
+    ffi_guard(-71, || {
+        if client.is_null() {
+            return -22;
+        }
+        let client = unsafe { &mut *client };
+        if file.is_null() {
+            return client.set_error_message("file handle must not be null".to_string());
+        }
+        let file = unsafe { &*file };
+        let out = if out_len == 0 {
+            &mut []
+        } else if out_data.is_null() {
+            return client
+                .set_error_message("out_data must not be null when out_len > 0".to_string());
+        } else {
+            unsafe { slice::from_raw_parts_mut(out_data, out_len) }
+        };
+
+        match client.client.read_at(&file.file, offset, out) {
+            Ok(()) => {
+                client.clear_error();
+                0
+            }
+            Err(err) => client.set_error(err),
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn mfs_client_pwrite(
+    client: *mut MfsClientHandle,
+    file: *const MfsOpenFileHandle,
+    offset: u64,
+    data: *const c_uchar,
+    data_len: usize,
+) -> c_int {
+    ffi_guard(-71, || {
+        if client.is_null() {
+            return -22;
+        }
+        let client = unsafe { &mut *client };
+        if file.is_null() {
+            return client.set_error_message("file handle must not be null".to_string());
+        }
+        let file = unsafe { &*file };
+        let bytes = if data_len == 0 {
+            &[]
+        } else if data.is_null() {
+            return client.set_error_message("data must not be null when data_len > 0".to_string());
+        } else {
+            unsafe { slice::from_raw_parts(data, data_len) }
+        };
+
+        match client.client.write_at(&file.file, offset, bytes) {
+            Ok(()) => {
+                client.clear_error();
+                0
+            }
+            Err(err) => client.set_error(err),
         }
     })
 }

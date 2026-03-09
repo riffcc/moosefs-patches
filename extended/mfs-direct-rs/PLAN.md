@@ -2,8 +2,9 @@
 
 ## Goal
 
-Create `extended/mfs-direct-rs` as a Rust crate that can write directly to
-MooseFS from userspace by speaking the protocol natively.
+Build `extended/mfs-direct-rs` into a native MooseFS transport library for
+userspace consumers that want direct namespace, chunk, and positioned I/O
+access without going through a mount.
 
 ## Architecture
 
@@ -18,26 +19,32 @@ Provide:
 
 ### Layer 2: master client
 
-Implement:
+Implemented:
 
 - `register_session`
+- `reconnect_session`
 - `lookup_path`
+- `getattr`
 - `create_path`
+- `mkdir -p`
 - `open`
 - `truncate`
+- `unlink` / `rmdir` / `rename`
 - `read_chunk` metadata lookup
 - `write_chunk` metadata lookup
 - `write_chunk_end`
 
 ### Layer 3: chunkserver client
 
-Implement:
+Implemented:
 
+- `read`
 - `write_start`
 - `write_data`
 - `write_finish`
 - status handling
 - CRC32 for write fragments
+- chunk metadata caching
 
 ### Layer 4: ergonomic client API
 
@@ -45,17 +52,26 @@ Expose:
 
 - `connect(master_addr, options)`
 - `lookup_path(path)`
+- `stat_path(path)`
+- `ensure_dir_all(path)`
 - `ensure_file(path, size)`
+- `open_file(path)`
+- `ensure_file_len(path, size)`
+- `read_all(path)`
 - `write_all(path, bytes)`
+- `read_at(file, offset, out)`
+- `write_at(file, offset, bytes)`
 
-## First implementation target
+## Current Milestone
 
-The first success criterion is:
+The current success criterion is already met:
 
 - connect to a live MooseFS master
-- create or reuse a file under an existing directory
-- stream bytes to the selected chunkserver
+- create or reuse a file
+- stream bytes to a selected chunkserver
 - commit the write back to the master
+- reopen and read the written bytes back
+- expose the path through a C ABI for downstream consumers
 
 ## Important protocol facts
 
@@ -77,17 +93,20 @@ The first success criterion is:
 - `src/protocol.rs`
 - `src/client.rs`
 
-Possible later additions:
+Current files:
 
-- `src/master.rs`
-- `src/chunkserver.rs`
-- `src/object.rs`
+- `src/lib.rs`
+- `src/error.rs`
+- `src/protocol.rs`
+- `src/client.rs`
 - `src/ffi.rs`
+- `src/quic.rs`
 
-## Immediate follow-ups after v1 works
+## Next High-Value Follow-Ups
 
-1. recursive parent creation
-2. direct read path
-3. object/block oriented wrapper
-4. storage-class and label-aware policy selection
-5. C ABI for Go/cgo consumers like IPFS-HA
+1. block-oriented wrapper above positioned I/O
+2. retry and replica failover policy
+3. storage-class and label-aware policy selection
+4. tighter integration path for downstream consumers like the flatfs
+   multi-writer fork
+5. QUIC stream-path validation against a live MooseFS endpoint
