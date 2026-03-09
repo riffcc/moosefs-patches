@@ -54,6 +54,7 @@
 #define HELPER_READ_STRIPE_META_MAX 16
 #define HELPER_READ_STRIPE_FILL_CREDITS 4U
 #define HELPER_READ_PREFETCH_WORKERS 1
+#define HELPER_READ_META_CHANNELS (HELPER_READ_WORKERS + HELPER_READ_PREFETCH_WORKERS)
 #define HELPER_READ_PREFETCH_QUEUE_MAX 2
 #define HELPER_READ_PREFETCH_DATA_CACHE_MAX 2
 #define HELPER_READ_PREFETCH_WORKER_MAX (8U * 1024U * 1024U)
@@ -161,6 +162,7 @@ struct read_state {
 	uint32_t prefetch_len;
 	uint64_t last_end;
 	uint64_t seq_bytes;
+	uint32_t meta_lane_id;
 	uint32_t preferred_ip;
 	uint16_t preferred_port;
 	uint64_t stripe_band;
@@ -197,6 +199,13 @@ struct read_worker_arg {
 	uint32_t worker_id;
 };
 
+struct read_meta_channel {
+	int fd;
+	uint32_t next_msgid;
+	time_t last_nop;
+	pthread_mutex_t mu;
+};
+
 struct helper_session {
 	bool active;
 	int master_fd;
@@ -210,7 +219,6 @@ struct helper_session {
 	pthread_t master_thread;
 	pthread_mutex_t master_mu;
 	pthread_cond_t master_cv;
-	pthread_mutex_t read_chunk_meta_mu;
 	bool master_thread_running;
 	bool master_thread_stop;
 	bool master_req_pending;
@@ -261,6 +269,7 @@ struct helper_session {
 	uint32_t read_stream_next_worker;
 	uint64_t read_stream_next_id;
 	struct read_stream_ctx read_streams[HELPER_READ_STREAM_AFFINITY_MAX];
+	struct read_meta_channel read_meta_channels[HELPER_READ_META_CHANNELS];
 	bool read_worker_running;
 	bool read_worker_stop;
 	pthread_mutex_t getattr_cache_mu;
@@ -289,6 +298,7 @@ static int session_write_chunk_end(struct helper_session *s,
 				   uint32_t chunk_off, uint32_t write_size);
 static int session_finalize_active_write(struct helper_session *s);
 static int session_read_chunk_meta(struct helper_session *s,
+				   uint32_t lane_id,
 				   uint32_t inode, uint32_t chunk_idx,
 				   struct chunk_meta *m);
 static const struct cs_loc *choose_read_replica(struct helper_session *s,
@@ -1520,6 +1530,8 @@ static bool master_conn_broken(int ret)
 
 static void session_reset_state(struct helper_session *s)
 {
+	size_t i;
+
 	if (s->master_fd >= 0) {
 		close(s->master_fd);
 		s->master_fd = -1;
@@ -1547,6 +1559,14 @@ static void session_reset_state(struct helper_session *s)
 	session_reset_read_scoreboard(s);
 	session_reset_read_prefetch(s);
 	session_reset_read_meta_cache(s);
+	for (i = 0; i < HELPER_READ_META_CHANNELS; i++) {
+		if (s->read_meta_channels[i].fd >= 0) {
+			close(s->read_meta_channels[i].fd);
+			s->read_meta_channels[i].fd = -1;
+		}
+		s->read_meta_channels[i].next_msgid = 1;
+		s->read_meta_channels[i].last_nop = time(NULL);
+	}
 	if (s->write_cs_fd >= 0) {
 		close(s->write_cs_fd);
 		s->write_cs_fd = -1;
@@ -1621,17 +1641,82 @@ static int build_register_packet(const char *subdir, uint8_t **pkt_out,
 	return 0;
 }
 
-static int session_reregister(struct helper_session *s)
+static int build_reconnect_packet(uint32_t session_id,
+				  uint8_t **pkt_out, uint32_t *pkt_len_out)
+{
+	uint8_t *pkt;
+
+	if (!pkt_out || !pkt_len_out)
+		return -EINVAL;
+
+	pkt = calloc(1, 64 + 1 + 4 + 2 + 1 + 1);
+	if (!pkt)
+		return -ENOMEM;
+
+	memcpy(pkt, FUSE_REGISTER_BLOB_ACL, 64);
+	pkt[64] = REGISTER_RECONNECT;
+	put32be(pkt + 65, session_id);
+	put16be(pkt + 69, MFS_VERSMAJ);
+	pkt[71] = MFS_VERSMID;
+	pkt[72] = MFS_VERSMIN;
+
+	*pkt_out = pkt;
+	*pkt_len_out = 73;
+	return 0;
+}
+
+static int parse_reconnect_reply(struct helper_session *s,
+				 const uint8_t *rsp, uint32_t rsp_len,
+				 uint32_t *negotiated_version_out)
+{
+	uint32_t negotiated_version = s->master_version;
+	uint8_t status;
+
+	if (!rsp || rsp_len == 0)
+		return -EPROTO;
+
+	if (rsp_len == 1) {
+		status = rsp[0];
+	} else if (rsp_len == 5) {
+		negotiated_version = get32be(rsp);
+		status = rsp[4];
+	} else if (rsp_len == 13) {
+		negotiated_version = get32be(rsp);
+		status = rsp[12];
+	} else {
+		return -EPROTO;
+	}
+
+	if (status != 0)
+		return status;
+
+	if (negotiated_version_out)
+		*negotiated_version_out = negotiated_version;
+	return 0;
+}
+
+static uint32_t read_meta_channel_next_msgid(struct read_meta_channel *ch)
+{
+	uint32_t current = ch->next_msgid++;
+
+	if (ch->next_msgid == 0)
+		ch->next_msgid = 1;
+	return current;
+}
+
+static int read_meta_channel_connect(struct helper_session *s,
+				     struct read_meta_channel *ch)
 {
 	uint8_t *pkt = NULL;
 	uint8_t *rsp = NULL;
 	uint32_t pkt_len = 0;
 	uint32_t rsp_len = 0;
-	uint32_t v1, v2;
-	int ret;
+	uint32_t rsp_type = 0;
+	uint32_t negotiated_version = s->master_version;
 	int fd;
+	int ret;
 
-	if (!s->master_host[0] || s->master_port == 0)
+	if (!s->master_host[0] || s->master_port == 0 || s->session_id == 0)
 		return -EINVAL;
 
 	fd = connect_tcp(s->master_host, s->master_port, HELPER_MASTER_TIMEOUT_MS);
@@ -1639,7 +1724,7 @@ static int session_reregister(struct helper_session *s)
 		return fd;
 	set_socket_timeouts(fd, HELPER_MASTER_TIMEOUT_MS);
 
-	ret = build_register_packet(s->subdir, &pkt, &pkt_len);
+	ret = build_reconnect_packet(s->session_id, &pkt, &pkt_len);
 	if (ret) {
 		close(fd);
 		return ret;
@@ -1647,49 +1732,146 @@ static int session_reregister(struct helper_session *s)
 
 	ret = master_send_packet(fd, CLTOMA_FUSE_REGISTER, pkt, pkt_len);
 	free(pkt);
+	pkt = NULL;
 	if (ret) {
 		close(fd);
 		return ret;
-	}
-	ret = master_recv_packet(fd, &v1, &rsp, &rsp_len);
-	if (ret) {
-		close(fd);
-		return ret;
-	}
-	if (v1 != MATOCL_FUSE_REGISTER) {
-		free(rsp);
-		close(fd);
-		return -EPROTO;
-	}
-	if (rsp_len == 1) {
-		ret = rsp[0];
-		free(rsp);
-		close(fd);
-		return ret;
-	}
-	if (rsp_len < 8) {
-		free(rsp);
-		close(fd);
-		return -EPROTO;
 	}
 
-	v1 = get32be(rsp);
-	v2 = get32be(rsp + 4);
-	if (v1 >= 0x00010000 && v1 <= 0x0fffffff) {
-		s->master_version = v1;
-		s->session_id = v2;
-	} else {
-		s->master_version = 0;
-		s->session_id = v1;
+	ret = master_recv_packet(fd, &rsp_type, &rsp, &rsp_len);
+	if (ret) {
+		close(fd);
+		return ret;
 	}
+	if (rsp_type != MATOCL_FUSE_REGISTER) {
+		free(rsp);
+		close(fd);
+		return -EPROTO;
+	}
+	ret = parse_reconnect_reply(s, rsp, rsp_len, &negotiated_version);
 	free(rsp);
+	if (ret) {
+		close(fd);
+		return ret;
+	}
 
+	if (ch->fd >= 0)
+		close(ch->fd);
+	ch->fd = fd;
+	ch->next_msgid = 1;
+	ch->last_nop = time(NULL);
+	if (negotiated_version)
+		s->master_version = negotiated_version;
+	return 0;
+}
+
+static int read_meta_channel_rpc(struct helper_session *s,
+				 struct read_meta_channel *ch,
+				 uint32_t req_type, const uint8_t *req_data, uint32_t req_len,
+				 uint32_t rsp_type, uint8_t **rsp_data, uint32_t *rsp_len)
+{
+	uint8_t *pkt = NULL;
+	uint32_t pkt_len = 0;
+	uint32_t got_type = 0;
+	uint32_t req_msgid = 0;
+	unsigned int skipped = 0;
+	int ret;
+
+	if (!rsp_data || !rsp_len)
+		return -EINVAL;
+	*rsp_data = NULL;
+	*rsp_len = 0;
+
+	if (ch->fd < 0) {
+		ret = read_meta_channel_connect(s, ch);
+		if (ret)
+			return ret;
+	}
+
+	req_msgid = req_has_msgid(req_type, req_len) ? get32be(req_data) : 0;
+	ret = master_send_packet(ch->fd, req_type, req_data, req_len);
+	if (ret) {
+		if (master_conn_broken(ret)) {
+			ret = read_meta_channel_connect(s, ch);
+			if (ret)
+				return ret;
+			ret = master_send_packet(ch->fd, req_type, req_data, req_len);
+		}
+		if (ret)
+			return ret;
+	}
+
+	for (;;) {
+		ret = master_recv_packet(ch->fd, &got_type, &pkt, &pkt_len);
+		if (ret) {
+			if (pkt) {
+				free(pkt);
+				pkt = NULL;
+			}
+			if (master_conn_broken(ret)) {
+				ret = read_meta_channel_connect(s, ch);
+				if (ret)
+					return ret;
+				ret = master_send_packet(ch->fd, req_type, req_data, req_len);
+				if (ret)
+					return ret;
+				continue;
+			}
+			return ret;
+		}
+		if (got_type != rsp_type) {
+			if (packet_is_unsolicited(got_type, pkt, pkt_len)) {
+				free(pkt);
+				pkt = NULL;
+				if (++skipped > HELPER_MASTER_MAX_SKIPPED_PKTS)
+					return -EPROTO;
+				continue;
+			}
+			free(pkt);
+			return -EPROTO;
+		}
+		if (req_msgid != 0) {
+			if (pkt_len < 4) {
+				free(pkt);
+				return -EPROTO;
+			}
+			if (get32be(pkt) != req_msgid) {
+				free(pkt);
+				pkt = NULL;
+				if (++skipped > HELPER_MASTER_MAX_SKIPPED_PKTS)
+					return -EPROTO;
+				continue;
+			}
+		}
+		*rsp_data = pkt;
+		*rsp_len = pkt_len;
+		return 0;
+	}
+}
+
+static int session_reregister(struct helper_session *s)
+{
+	struct read_meta_channel scratch = {
+		.fd = -1,
+		.next_msgid = 1,
+		.last_nop = time(NULL),
+	};
+	int ret;
+
+	if (!s->master_host[0] || s->master_port == 0 || s->session_id == 0)
+		return -EINVAL;
+
+	pthread_mutex_init(&scratch.mu, NULL);
+	ret = read_meta_channel_connect(s, &scratch);
+	pthread_mutex_destroy(&scratch.mu);
+	if (ret)
+		return ret;
 	if (s->master_fd >= 0)
 		close(s->master_fd);
-	s->master_fd = fd;
+	s->master_fd = scratch.fd;
 	s->next_msgid = 1;
 	s->active = true;
-	vlog("master reconnect: new session=%u master_version=0x%08x",
+	vlog("master reconnect: resumed session=%u master_version=0x%08x",
 	     s->session_id, s->master_version);
 	return 0;
 }
@@ -2025,7 +2207,8 @@ static void *read_prefetch_thread_main(void *arg)
 		pthread_mutex_unlock(&s->read_prefetch_mu);
 
 		if (!session_lookup_read_meta_cache(s, work.inode, work.chunk_idx, &meta, &ret)) {
-			ret = session_read_chunk_meta(s, work.inode, work.chunk_idx, &meta);
+			ret = session_read_chunk_meta(s, HELPER_READ_WORKERS,
+						     work.inode, work.chunk_idx, &meta);
 			if (ret == MFS_ERROR_NOCHUNKSERVERS || ret == MFS_ERROR_NOCHUNK) {
 				session_store_read_meta_cache(s, work.inode, work.chunk_idx, ret, NULL);
 				continue;
@@ -3457,6 +3640,7 @@ static int parse_chunk_meta_rsp(uint32_t msgid, const uint8_t *rsp, uint32_t rsp
 }
 
 static int session_read_chunk_meta(struct helper_session *s,
+				   uint32_t lane_id,
 				   uint32_t inode, uint32_t chunk_idx,
 				   struct chunk_meta *m)
 {
@@ -3464,21 +3648,26 @@ static int session_read_chunk_meta(struct helper_session *s,
 	uint8_t *rsp = NULL;
 	uint32_t rsp_len = 0;
 	uint32_t msgid;
+	struct read_meta_channel *ch;
 	int ret;
 
-	pthread_mutex_lock(&s->read_chunk_meta_mu);
-	msgid = next_msgid(s);
+	if (lane_id >= HELPER_READ_META_CHANNELS)
+		lane_id = 0;
+	ch = &s->read_meta_channels[lane_id];
+
+	pthread_mutex_lock(&ch->mu);
+	msgid = read_meta_channel_next_msgid(ch);
 	put32be(pkt, msgid);
 	put32be(pkt + 4, inode);
 	put32be(pkt + 8, chunk_idx);
 	pkt[12] = 0;
-	ret = master_rpc(s, CLTOMA_FUSE_READ_CHUNK, pkt, sizeof(pkt),
-			 MATOCL_FUSE_READ_CHUNK, &rsp, &rsp_len);
+	ret = read_meta_channel_rpc(s, ch, CLTOMA_FUSE_READ_CHUNK, pkt, sizeof(pkt),
+				    MATOCL_FUSE_READ_CHUNK, &rsp, &rsp_len);
 	if (ret)
 		goto out_unlock;
 	ret = parse_chunk_meta_rsp(msgid, rsp, rsp_len, m);
 out_unlock:
-	pthread_mutex_unlock(&s->read_chunk_meta_mu);
+	pthread_mutex_unlock(&ch->mu);
 	free(rsp);
 	if (ret)
 		return ret;
@@ -3606,7 +3795,7 @@ static int read_state_fetch_one_chunk_meta(struct helper_session *s,
 		return cached_status;
 	}
 
-	ret = session_read_chunk_meta(s, inode, chunk_idx, m);
+	ret = session_read_chunk_meta(s, rs->meta_lane_id, inode, chunk_idx, m);
 	if (ret) {
 		vlog("read_meta: fetch failed inode=%u chunk=%u ret=%d", inode, chunk_idx, ret);
 		if (ret == MFS_ERROR_NOCHUNKSERVERS || ret == MFS_ERROR_NOCHUNK) {
@@ -5397,6 +5586,7 @@ static void *read_worker_thread_main(void *arg)
 			if (!ctx) {
 				status = -ESHUTDOWN;
 			} else {
+				ctx->rs.meta_lane_id = worker_id;
 				vlog("read_worker: start worker=%u stream_id=%llu hint=%u inode=%u off=%llu size=%u band=%llu",
 				     worker_id,
 				     (unsigned long long)ctx->stream_id,
@@ -5426,12 +5616,13 @@ static void *read_worker_thread_main(void *arg)
 			ctx->in_flight = false;
 			ctx->last_used_ms = monotonic_ms();
 			if (req && status >= 0) {
-				uint64_t consumed = rsp_len;
+				uint64_t consumed = 0;
+				const struct mfs_ctrl_read_rsp *rr =
+					(rsp_payload && rsp_len >= sizeof(struct mfs_ctrl_read_rsp)) ?
+					(const struct mfs_ctrl_read_rsp *)rsp_payload : NULL;
 
-				if (consumed >= sizeof(struct mfs_ctrl_read_rsp))
-					consumed -= sizeof(struct mfs_ctrl_read_rsp);
-				else
-					consumed = 0;
+				if (rr)
+					consumed = rr->size;
 				ctx->last_offset = req->offset;
 				ctx->next_offset = req->offset + consumed;
 				ctx->band = mfs_read_band(ctx->next_offset);
@@ -5606,6 +5797,12 @@ int main(int argc, char **argv)
 	pthread_mutex_init(&session.getattr_cache_mu, NULL);
 	pthread_cond_init(&session.getattr_cache_cv, NULL);
 	pthread_mutex_init(&session.ctrl_write_mu, NULL);
+	for (size_t i = 0; i < HELPER_READ_META_CHANNELS; i++) {
+		session.read_meta_channels[i].fd = -1;
+		session.read_meta_channels[i].next_msgid = 1;
+		session.read_meta_channels[i].last_nop = time(NULL);
+		pthread_mutex_init(&session.read_meta_channels[i].mu, NULL);
+	}
 	session.master_last_nop = time(NULL);
 	session_start_read_prefetch_thread(&session);
 	session_start_read_workers(&session);
@@ -5700,5 +5897,7 @@ int main(int argc, char **argv)
 	pthread_mutex_destroy(&session.getattr_cache_mu);
 	pthread_cond_destroy(&session.getattr_cache_cv);
 	pthread_mutex_destroy(&session.ctrl_write_mu);
+	for (size_t i = 0; i < HELPER_READ_META_CHANNELS; i++)
+		pthread_mutex_destroy(&session.read_meta_channels[i].mu);
 	return 0;
 }
