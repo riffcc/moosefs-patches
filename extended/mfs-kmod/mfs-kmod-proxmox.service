@@ -1,0 +1,13 @@
+[Unit]
+Description=MooseFS kernel-driver sidecar mount for proxmox export
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/mfs-kmod-proxmox-up.sh
+ExecStop=/usr/local/sbin/mfs-kmod-proxmox-down.sh
+
+[Install]
+WantedBy=multi-user.target
