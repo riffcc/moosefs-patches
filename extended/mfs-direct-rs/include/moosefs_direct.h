@@ -10,6 +10,13 @@ extern "C" {
 
 typedef struct MfsClientHandle MfsClientHandle;
 typedef struct MfsOpenFileHandle MfsOpenFileHandle;
+typedef struct MfsDirEntry {
+    char *name;
+    uint32_t inode;
+    uint8_t file_type;
+    uint8_t _reserved[3];
+    uint64_t size;
+} MfsDirEntry;
 
 MfsClientHandle *mfs_client_connect(const char *master_addr,
                                     const char *subdir,
@@ -19,6 +26,12 @@ void mfs_client_destroy(MfsClientHandle *handle);
 void mfs_file_destroy(MfsOpenFileHandle *handle);
 
 const char *mfs_client_last_error(const MfsClientHandle *handle);
+
+int mfs_client_list_dir(MfsClientHandle *handle,
+                        const char *path,
+                        MfsDirEntry **out_entries,
+                        size_t *out_count);
+void mfs_dir_entries_free(MfsDirEntry *entries, size_t count);
 
 MfsOpenFileHandle *mfs_client_open_file(MfsClientHandle *handle,
                                         const char *path);

@@ -10,3 +10,5 @@ pub use client::{
 };
 pub use error::{Error, Result};
 pub use quic::{probe_quic_endpoint, PacketModeMaster, QuicConnectConfig, QuicEndpointInfo};
+#[cfg(feature = "quic")]
+pub use quic::QuicStreamMaster;

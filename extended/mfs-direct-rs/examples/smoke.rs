@@ -3,10 +3,12 @@ use std::net::TcpStream;
 use std::process;
 
 use moosefs_direct::{probe_quic_endpoint, Client, ConnectOptions, PacketModeMaster};
+#[cfg(feature = "quic")]
+use moosefs_direct::QuicStreamMaster;
 
 fn usage(program: &str) -> String {
     format!(
-        "usage:\n  {program} write <master:port> <path> <data> [password]\n  {program} read <master:port> <path> [password]\n  {program} stat <master:port> <path> [password]\n  {program} quicprobe <master:port>\n  {program} quicstat <master:port> <path> [password]"
+        "usage:\n  {program} write <master:port> <path> <data> [password]\n  {program} read <master:port> <path> [password]\n  {program} stat <master:port> <path> [password]\n  {program} quicprobe <master:port>\n  {program} quicstat <master:port> <path> [password]\n  {program} quicpacketstat <master:port> <path> [password]"
     )
 }
 
@@ -25,6 +27,7 @@ fn main() {
     let password = match command {
         "write" if args.len() == 6 => Some(args[5].as_str()),
         "read" if args.len() == 5 => Some(args[4].as_str()),
+        "quicstat" if args.len() == 5 => Some(args[4].as_str()),
         _ => env_password.as_deref(),
     };
     let mut options = match password {
@@ -61,10 +64,37 @@ fn main() {
         }
     }
     if command == "quicstat" {
+        #[cfg(feature = "quic")]
+        {
+            let mut client = match Client::<QuicStreamMaster>::connect_registered(master, options) {
+                Ok(client) => client,
+                Err(err) => {
+                    eprintln!("quic connect/register failed: {err}");
+                    process::exit(1);
+                }
+            };
+            match client.lookup_path(path) {
+                Ok(inode) => {
+                    println!("inode={inode}");
+                    return;
+                }
+                Err(err) => {
+                    eprintln!("quic stat failed: {err}");
+                    process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(feature = "quic"))]
+        {
+            eprintln!("quicstat requires the crate to be built with --features quic");
+            process::exit(2);
+        }
+    }
+    if command == "quicpacketstat" {
         let mut client = match Client::<PacketModeMaster>::connect_registered(master, options) {
             Ok(client) => client,
             Err(err) => {
-                eprintln!("quic connect/register failed: {err}");
+                eprintln!("quic packet-mode connect/register failed: {err}");
                 process::exit(1);
             }
         };

@@ -23,6 +23,8 @@ pub const CLTOMA_FUSE_RMDIR: u32 = 422;
 pub const MATOCL_FUSE_RMDIR: u32 = 423;
 pub const CLTOMA_FUSE_RENAME: u32 = 424;
 pub const MATOCL_FUSE_RENAME: u32 = 425;
+pub const CLTOMA_FUSE_READDIR: u32 = 428;
+pub const MATOCL_FUSE_READDIR: u32 = 429;
 pub const CLTOMA_FUSE_OPEN: u32 = 430;
 pub const MATOCL_FUSE_OPEN: u32 = 431;
 pub const CLTOMA_FUSE_READ_CHUNK: u32 = 432;
@@ -65,6 +67,7 @@ pub const QUIC_HELLO_FLAG_TLS: u32 = 0x0000_0010;
 pub const TYPE_FILE: u8 = 1;
 pub const TYPE_DIRECTORY: u8 = 2;
 pub const OPEN_READWRITE: u8 = 2;
+pub const GETDIR_FLAG_WITHATTR: u8 = 0x01;
 
 pub const REGISTER_BLOB_ACL: &[u8; 64] =
     b"DjI1GAQDULI5d2YjA26ypc3ovkhjvhciTQVx3CS4nYgtBoUcsljiVpsErJENHaw0";
@@ -236,6 +239,14 @@ pub fn attr_size(attr: &[u8]) -> u64 {
     ])
 }
 
+pub fn attr_record_len(attr: &[u8]) -> usize {
+    if attr.first().copied().unwrap_or_default() < 64 {
+        35
+    } else {
+        36
+    }
+}
+
 pub fn crc32_update(seed: u32, data: &[u8]) -> u32 {
     let mut crc = !seed;
     for &byte in data {
@@ -250,7 +261,10 @@ pub fn crc32_update(seed: u32, data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{attr_size, attr_type, crc32_update, decode_u32_be, read_packet, write_packet, Packet};
+    use super::{
+        attr_record_len, attr_size, attr_type, crc32_update, decode_u32_be, read_packet,
+        write_packet, Packet,
+    };
     use std::io::Cursor;
 
     #[test]
@@ -276,5 +290,12 @@ mod tests {
         attr[27..35].copy_from_slice(&123u64.to_be_bytes());
         assert_eq!(attr_type(&attr), super::TYPE_DIRECTORY);
         assert_eq!(attr_size(&attr), 123);
+        assert_eq!(attr_record_len(&attr), 35);
+    }
+
+    #[test]
+    fn attr_record_len_handles_newer_layout() {
+        let attr = [64u8; 36];
+        assert_eq!(attr_record_len(&attr), 36);
     }
 }

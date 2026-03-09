@@ -56,6 +56,11 @@ a real userspace MooseFS client path for:
 - chunk-location decode
 - direct chunkserver reads/writes
 
+## Roadmap Context
+
+The longer-range backlog and preserved future ideas live in [`ROADMAP.md`](./ROADMAP.md).
+The README describes current shape; the roadmap keeps the deferred ideas visible.
+
 ## Current Capabilities
 
 Today this crate already supports:

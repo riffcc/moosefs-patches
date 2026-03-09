@@ -15,6 +15,15 @@ pub struct MfsOpenFileHandle {
     file: crate::OpenFile,
 }
 
+#[repr(C)]
+pub struct MfsDirEntry {
+    pub name: *mut c_char,
+    pub inode: u32,
+    pub file_type: u8,
+    pub _reserved: [u8; 3],
+    pub size: u64,
+}
+
 impl MfsClientHandle {
     fn new(client: Client<TcpStream>) -> Self {
         Self {
@@ -113,6 +122,23 @@ pub extern "C" fn mfs_file_destroy(handle: *mut MfsOpenFileHandle) {
 }
 
 #[no_mangle]
+pub extern "C" fn mfs_dir_entries_free(
+    entries: *mut MfsDirEntry,
+    count: usize,
+) {
+    if entries.is_null() {
+        return;
+    }
+    let mut entries = unsafe { Vec::from_raw_parts(entries, count, count) };
+    for entry in &mut entries {
+        if !entry.name.is_null() {
+            let _ = unsafe { CString::from_raw(entry.name) };
+            entry.name = ptr::null_mut();
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn mfs_client_last_error(handle: *const MfsClientHandle) -> *const c_char {
     if handle.is_null() {
         return ptr::null();
@@ -122,6 +148,52 @@ pub extern "C" fn mfs_client_last_error(handle: *const MfsClientHandle) -> *cons
         .last_error
         .as_ref()
         .map_or(ptr::null(), |msg| msg.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn mfs_client_list_dir(
+    handle: *mut MfsClientHandle,
+    path: *const c_char,
+    out_entries: *mut *mut MfsDirEntry,
+    out_count: *mut usize,
+) -> c_int {
+    ffi_guard(-71, || {
+        if handle.is_null() || out_entries.is_null() || out_count.is_null() {
+            return -22;
+        }
+        let handle = unsafe { &mut *handle };
+        let path = match cstr_arg(path, "path") {
+            Ok(path) => path,
+            Err(err) => return handle.set_error_message(err),
+        };
+
+        match handle.client.list_dir(path) {
+            Ok(entries) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let name = sanitize_cstring(entry.name);
+                    out.push(MfsDirEntry {
+                        name: name.into_raw(),
+                        inode: entry.inode,
+                        file_type: entry.file_type,
+                        _reserved: [0; 3],
+                        size: entry.size,
+                    });
+                }
+                let mut boxed = out.into_boxed_slice();
+                let count = boxed.len();
+                let ptr = boxed.as_mut_ptr();
+                std::mem::forget(boxed);
+                unsafe {
+                    *out_entries = ptr;
+                    *out_count = count;
+                }
+                handle.clear_error();
+                0
+            }
+            Err(err) => handle.set_error(err),
+        }
+    })
 }
 
 #[no_mangle]

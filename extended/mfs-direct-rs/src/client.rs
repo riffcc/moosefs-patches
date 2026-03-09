@@ -4,22 +4,25 @@ use std::net::TcpStream;
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    attr_size, attr_type, crc32_update, decode_u16_be, decode_u32_be, decode_u64_be,
-    expect_msgid, expect_simple_status, read_packet, response_status, roundtrip, write_packet,
-    version_int, BLOCK_SIZE, CHUNKOPFLAG_CANMODTIME, CHUNK_SIZE, CLTOMA_FUSE_CREATE,
-    CLTOMA_FUSE_GETATTR, CLTOMA_FUSE_LOOKUP, CLTOMA_FUSE_MKDIR, CLTOMA_FUSE_OPEN,
-    CLTOMA_FUSE_READ_CHUNK, CLTOMA_FUSE_REGISTER, CLTOMA_FUSE_RENAME,
-    CLTOMA_FUSE_RMDIR, CLTOMA_FUSE_TRUNCATE, CLTOMA_FUSE_UNLINK, CLTOMA_FUSE_WRITE_CHUNK,
-    CLTOMA_FUSE_WRITE_CHUNK_END, CLTOCS_READ, CLTOCS_WRITE, CLTOCS_WRITE_DATA,
-    CLTOCS_WRITE_FINISH, CSTOCL_READ_DATA, CSTOCL_READ_STATUS, CSTOCL_WRITE_STATUS,
-    DEFAULT_MASTER_PORT, MATOCL_FUSE_CREATE, MATOCL_FUSE_GETATTR, MATOCL_FUSE_LOOKUP,
-    MATOCL_FUSE_MKDIR, MATOCL_FUSE_OPEN, MATOCL_FUSE_READ_CHUNK, MATOCL_FUSE_REGISTER,
-    MATOCL_FUSE_RENAME, MATOCL_FUSE_RMDIR, MATOCL_FUSE_TRUNCATE, MATOCL_FUSE_UNLINK,
-    MATOCL_FUSE_WRITE_CHUNK, MATOCL_FUSE_WRITE_CHUNK_END, OPEN_READWRITE, REGISTER_BLOB_ACL,
-    REGISTER_NEWSESSION, REGISTER_RECONNECT, ROOT_INODE, TYPE_DIRECTORY, TYPE_FILE,
-    VERSION_MAJOR, VERSION_MID, VERSION_MINOR,
+    attr_record_len, attr_size, attr_type, crc32_update, decode_u16_be, decode_u32_be,
+    decode_u64_be, expect_msgid, expect_simple_status, read_packet, response_status, roundtrip,
+    write_packet, version_int, BLOCK_SIZE, CHUNKOPFLAG_CANMODTIME, CHUNK_SIZE,
+    CLTOMA_FUSE_CREATE, CLTOMA_FUSE_GETATTR, CLTOMA_FUSE_LOOKUP, CLTOMA_FUSE_MKDIR,
+    CLTOMA_FUSE_OPEN, CLTOMA_FUSE_READDIR, CLTOMA_FUSE_READ_CHUNK, CLTOMA_FUSE_REGISTER,
+    CLTOMA_FUSE_RENAME, CLTOMA_FUSE_RMDIR, CLTOMA_FUSE_TRUNCATE, CLTOMA_FUSE_UNLINK,
+    CLTOMA_FUSE_WRITE_CHUNK, CLTOMA_FUSE_WRITE_CHUNK_END, CLTOCS_READ, CLTOCS_WRITE,
+    CLTOCS_WRITE_DATA, CLTOCS_WRITE_FINISH, CSTOCL_READ_DATA, CSTOCL_READ_STATUS,
+    CSTOCL_WRITE_STATUS, DEFAULT_MASTER_PORT, GETDIR_FLAG_WITHATTR, MATOCL_FUSE_CREATE,
+    MATOCL_FUSE_GETATTR, MATOCL_FUSE_LOOKUP, MATOCL_FUSE_MKDIR, MATOCL_FUSE_OPEN,
+    MATOCL_FUSE_READDIR, MATOCL_FUSE_READ_CHUNK, MATOCL_FUSE_REGISTER, MATOCL_FUSE_RENAME,
+    MATOCL_FUSE_RMDIR, MATOCL_FUSE_TRUNCATE, MATOCL_FUSE_UNLINK, MATOCL_FUSE_WRITE_CHUNK,
+    MATOCL_FUSE_WRITE_CHUNK_END, OPEN_READWRITE, REGISTER_BLOB_ACL, REGISTER_NEWSESSION,
+    REGISTER_RECONNECT, ROOT_INODE, TYPE_DIRECTORY, TYPE_FILE, VERSION_MAJOR, VERSION_MID,
+    VERSION_MINOR,
 };
 use crate::quic::{probe_quic_endpoint, PacketModeMaster, QuicConnectConfig};
+#[cfg(feature = "quic")]
+use crate::quic::QuicStreamMaster;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectOptions {
@@ -135,6 +138,14 @@ pub struct WritePlan {
 pub struct OpenFile {
     pub path: String,
     pub inode: u32,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub inode: u32,
+    pub file_type: u8,
     pub size: u64,
 }
 
@@ -520,6 +531,36 @@ impl Client<PacketModeMaster> {
     }
 }
 
+#[cfg(feature = "quic")]
+impl Client<QuicStreamMaster> {
+    pub fn connect(master_addr: &str, options: ConnectOptions) -> Result<Self> {
+        if master_addr.is_empty() {
+            return Err(Error::InvalidInput("master_addr must not be empty"));
+        }
+        if options.subdir.is_empty() || !options.subdir.starts_with('/') {
+            return Err(Error::InvalidInput("subdir must be absolute"));
+        }
+        let (master, _) = QuicStreamMaster::connect(master_addr, &options.quic)?;
+        Ok(Self {
+            master,
+            session: None,
+            max_in_flight_write_fragments: options.max_in_flight_write_fragments.max(1),
+            experimental_ooo_write_acks: options.experimental_ooo_write_acks,
+            master_addr: Some(normalize_master_addr(master_addr)),
+            connect_options: Some(options),
+            read_chunk_cache: BTreeMap::new(),
+            write_chunk_cache: BTreeMap::new(),
+            read_session: None,
+        })
+    }
+
+    pub fn connect_registered(master_addr: &str, options: ConnectOptions) -> Result<Self> {
+        let mut client = Self::connect(master_addr, options.clone())?;
+        client.register_session(&options)?;
+        Ok(client)
+    }
+}
+
 impl<S: Read + Write> Client<S> {
     pub fn new(master: S) -> Self {
         Self {
@@ -725,6 +766,14 @@ impl<S: Read + Write> Client<S> {
         }
         let dst_parent_inode = self.ensure_dir_all(dst_parent)?;
         self.rename_name(src_parent_inode as u32, src_leaf, dst_parent_inode as u32, dst_leaf)
+    }
+
+    pub fn list_dir(&mut self, path: &str) -> Result<Vec<DirEntry>> {
+        let (inode, _, file_type) = self.lookup_path_details(path)?;
+        if file_type != TYPE_DIRECTORY {
+            return Err(Error::Protocol("path does not resolve to a directory"));
+        }
+        self.readdir(inode as u32)
     }
 
     pub fn ensure_file(&mut self, path: &str, size: u64) -> Result<u64> {
@@ -1080,6 +1129,38 @@ impl<S: Read + Write> Client<S> {
             return Err(Error::Protocol("short rename reply"));
         }
         Ok(())
+    }
+
+    fn readdir(&mut self, inode: u32) -> Result<Vec<DirEntry>> {
+        let msgid = self.session_mut()?.next_msgid();
+        let mut payload = Vec::with_capacity(33);
+        payload.extend_from_slice(&msgid.to_be_bytes());
+        payload.extend_from_slice(&inode.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.push(GETDIR_FLAG_WITHATTR);
+        payload.extend_from_slice(&100_000u32.to_be_bytes());
+        payload.extend_from_slice(&0u64.to_be_bytes());
+
+        let packet = roundtrip(
+            &mut self.master,
+            CLTOMA_FUSE_READDIR,
+            &payload,
+            MATOCL_FUSE_READDIR,
+        )?;
+        expect_msgid(&packet, msgid)?;
+        if packet.payload.len() == 5 {
+            return Err(Error::MoosefsStatus {
+                op: "readdir",
+                status: packet.payload[4],
+            });
+        }
+        if packet.payload.len() < 12 {
+            return Err(Error::Protocol("short readdir reply"));
+        }
+
+        parse_readdir_entries(&packet.payload[12..]).or_else(|_| parse_readdir_entries(&packet.payload[4..]))
     }
 
     fn open_check(&mut self, inode: u32, flags: u8) -> Result<()> {
@@ -1481,6 +1562,50 @@ fn normalize_master_addr(master_addr: &str) -> String {
     }
 }
 
+fn parse_readdir_entries(body: &[u8]) -> Result<Vec<DirEntry>> {
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < body.len() {
+        let name_len = *body
+            .get(offset)
+            .ok_or(Error::Protocol("truncated readdir entry name length"))?
+            as usize;
+        offset += 1;
+        if offset + name_len + 4 > body.len() {
+            return Err(Error::Protocol("truncated readdir entry"));
+        }
+
+        let name_bytes = &body[offset..offset + name_len];
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|_| Error::Protocol("readdir entry name is not valid UTF-8"))?
+            .to_string();
+        offset += name_len;
+
+        let inode = decode_u32_be(&body[offset..offset + 4])?;
+        offset += 4;
+
+        let attr = &body[offset..];
+        if attr.len() < 35 {
+            return Err(Error::Protocol("truncated readdir entry attr"));
+        }
+        let attr_len = attr_record_len(attr);
+        if attr.len() < attr_len {
+            return Err(Error::Protocol("truncated readdir entry attr"));
+        }
+
+        entries.push(DirEntry {
+            name,
+            inode,
+            file_type: attr_type(attr),
+            size: attr_size(attr),
+        });
+        offset += attr_len;
+    }
+
+    Ok(entries)
+}
+
 fn split_parent_and_name(path: &str) -> Result<(&str, &str)> {
     validate_absolute_path(path)?;
     if path == "/" {
@@ -1626,8 +1751,9 @@ fn recv_write_status(stream: &mut TcpStream, chunk_id: u64) -> Result<WriteStatu
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_chunk_location, normalize_master_addr, parse_ipv4_host, split_parent_and_name,
-        validate_absolute_path, ByteRange, ConfirmedRanges, ConnectOptions, MasterSession,
+        decode_chunk_location, normalize_master_addr, parse_ipv4_host, parse_readdir_entries,
+        split_parent_and_name, validate_absolute_path, ByteRange, ConfirmedRanges, ConnectOptions,
+        MasterSession,
     };
     use crate::protocol::{Packet, MATOCL_FUSE_WRITE_CHUNK};
 
@@ -1716,5 +1842,25 @@ mod tests {
     #[test]
     fn ipv4_parser_matches_wire_order() {
         assert_eq!(parse_ipv4_host("10.7.1.195").unwrap(), 0x0a07_01c3);
+    }
+
+    #[test]
+    fn readdir_entry_parser_handles_attr_entries() {
+        let mut body = Vec::new();
+        body.push(3);
+        body.extend_from_slice(b"foo");
+        body.extend_from_slice(&7u32.to_be_bytes());
+        let mut attr = [0u8; 35];
+        attr[0] = 0;
+        attr[1] = super::TYPE_FILE << 4;
+        attr[27..35].copy_from_slice(&99u64.to_be_bytes());
+        body.extend_from_slice(&attr);
+
+        let entries = parse_readdir_entries(&body).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "foo");
+        assert_eq!(entries[0].inode, 7);
+        assert_eq!(entries[0].file_type, super::TYPE_FILE);
+        assert_eq!(entries[0].size, 99);
     }
 }
