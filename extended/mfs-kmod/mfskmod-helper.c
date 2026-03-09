@@ -45,15 +45,19 @@
 #define HELPER_READ_SCOREBOARD_MAX 32
 #define HELPER_READ_META_CACHE_MAX 64
 #define HELPER_READ_AFFINITY_CACHE_MAX 64
+#define HELPER_READ_STREAM_AFFINITY_MAX 32
 #define HELPER_READ_FOREGROUND_MAX (4U * 1024U * 1024U)
 #define HELPER_READ_WORKERS 4
 #define HELPER_READ_JOB_QUEUE_MAX 32
 #define HELPER_READ_REPLICA_LOOKAHEAD 4U
+#define HELPER_READ_STREAM_BAND_SHIFT 28
+#define HELPER_READ_STRIPE_META_MAX 16
 #define HELPER_READ_PREFETCH_WORKERS 1
 #define HELPER_READ_PREFETCH_QUEUE_MAX 2
 #define HELPER_READ_PREFETCH_DATA_CACHE_MAX 2
 #define HELPER_READ_PREFETCH_WORKER_MAX (8U * 1024U * 1024U)
-#define HELPER_GETATTR_CACHE_TTL_MS 250U
+#define HELPER_GETATTR_CACHE_TTL_MS 5000U
+#define HELPER_GETATTR_CACHE_MAX 16
 #define VERSION2INT(maj,mid,min) ((maj) * 0x10000U + (mid) * 0x100U + (((maj) > 1) ? ((min) * 2U) : (min)))
 #define CHUNKOPFLAG_CANMODTIME 1U
 #define CHUNKOPFLAG_CONTINUEOP 2U
@@ -116,6 +120,37 @@ struct read_prefetch_data_entry {
 	uint64_t stamp;
 };
 
+struct read_stream_affinity_entry {
+	bool valid;
+	uint32_t inode;
+	uint64_t band;
+	uint32_t worker_id;
+	uint64_t stamp;
+};
+
+struct getattr_cache_entry {
+	bool valid;
+	bool pending;
+	uint32_t inode;
+	uint32_t uid;
+	uint32_t gid;
+	uint64_t expires_ms;
+	uint64_t stamp;
+	struct mfs_wire_attr attr;
+};
+
+/*
+ * Stripe-plan substrate: sequential readers should converge on one metadata
+ * plan per active band instead of rediscovering chunk metadata one request at
+ * a time.
+ */
+struct read_stripe_meta_entry {
+	bool valid;
+	uint32_t chunk_idx;
+	int status;
+	struct chunk_meta meta;
+};
+
 struct read_state {
 	bool meta_valid;
 	int meta_status;
@@ -135,6 +170,10 @@ struct read_state {
 	uint64_t seq_bytes;
 	uint32_t preferred_ip;
 	uint16_t preferred_port;
+	uint64_t stripe_band;
+	uint32_t stripe_base_chunk;
+	uint32_t stripe_chunk_count;
+	struct read_stripe_meta_entry stripe_meta[HELPER_READ_STRIPE_META_MAX];
 };
 
 struct read_job {
@@ -142,6 +181,12 @@ struct read_job {
 	struct mfs_ctrl_hdr hdr;
 	uint8_t *payload;
 	uint32_t payload_len;
+	uint32_t preferred_worker;
+};
+
+struct read_worker_arg {
+	struct helper_session *session;
+	uint32_t worker_id;
 };
 
 struct helper_session {
@@ -187,6 +232,7 @@ struct helper_session {
 	uint64_t read_seq_bytes;
 	pthread_t read_prefetch_threads[HELPER_READ_PREFETCH_WORKERS];
 	pthread_t read_workers[HELPER_READ_WORKERS];
+	struct read_worker_arg read_worker_args[HELPER_READ_WORKERS];
 	pthread_mutex_t read_prefetch_mu;
 	pthread_cond_t read_prefetch_cv;
 	bool read_prefetch_thread_running;
@@ -202,15 +248,15 @@ struct helper_session {
 	pthread_mutex_t read_job_mu;
 	pthread_cond_t read_job_cv;
 	struct read_job read_jobs[HELPER_READ_JOB_QUEUE_MAX];
+	uint64_t read_stream_affinity_clock;
+	uint32_t read_stream_next_worker;
+	struct read_stream_affinity_entry read_stream_affinity[HELPER_READ_STREAM_AFFINITY_MAX];
 	bool read_worker_running;
 	bool read_worker_stop;
 	pthread_mutex_t getattr_cache_mu;
-	bool getattr_cache_valid;
-	uint32_t getattr_cache_inode;
-	uint32_t getattr_cache_uid;
-	uint32_t getattr_cache_gid;
-	uint64_t getattr_cache_expires_ms;
-	struct mfs_wire_attr getattr_cache_attr;
+	pthread_cond_t getattr_cache_cv;
+	uint64_t getattr_cache_clock;
+	struct getattr_cache_entry getattr_cache[HELPER_GETATTR_CACHE_MAX];
 	int ctrl_fd;
 	pthread_mutex_t ctrl_write_mu;
 	bool write_meta_valid;
@@ -257,6 +303,11 @@ static int read_state_read_data(struct helper_session *s,
 				struct read_state *rs,
 				const struct mfs_ctrl_read_req *req,
 				uint8_t **out, uint32_t *out_len);
+static uint32_t session_select_read_worker(struct helper_session *s,
+					   const struct mfs_ctrl_read_req *req);
+static inline uint64_t mfs_read_band(loff_t offset);
+static inline uint64_t mfs_read_chunk_band(uint32_t chunk_idx);
+static inline uint32_t mfs_read_chunks_per_band(void);
 static int read_state_fetch_window(struct helper_session *s,
 				   struct read_state *rs,
 				   uint32_t inode,
@@ -308,6 +359,74 @@ static int helper_read_io_timeout_ms(struct helper_session *s)
 	if (active_reads >= 1)
 		return HELPER_READ_IO_TIMEOUT_MULTI_MS;
 	return HELPER_READ_IO_TIMEOUT_SINGLE_MS;
+}
+
+static inline uint64_t mfs_read_band(loff_t offset)
+{
+	return ((uint64_t)offset) >> HELPER_READ_STREAM_BAND_SHIFT;
+}
+
+static inline uint64_t mfs_read_chunk_band(uint32_t chunk_idx)
+{
+	return mfs_read_band((loff_t)chunk_idx * (loff_t)MFSCHUNKSIZE);
+}
+
+static inline uint32_t mfs_read_chunks_per_band(void)
+{
+	uint64_t band_bytes = 1ULL << HELPER_READ_STREAM_BAND_SHIFT;
+	uint32_t chunks = (uint32_t)(band_bytes / MFSCHUNKSIZE);
+
+	if (chunks == 0)
+		chunks = 1;
+	if (chunks > HELPER_READ_STRIPE_META_MAX)
+		chunks = HELPER_READ_STRIPE_META_MAX;
+	return chunks;
+}
+
+static uint32_t session_select_read_worker(struct helper_session *s,
+					   const struct mfs_ctrl_read_req *req)
+{
+	uint64_t band;
+	struct read_stream_affinity_entry *victim = NULL;
+	size_t i;
+
+	if (!req)
+		return 0;
+
+	band = mfs_read_band(req->offset);
+	for (i = 0; i < HELPER_READ_STREAM_AFFINITY_MAX; i++) {
+		struct read_stream_affinity_entry *ent = &s->read_stream_affinity[i];
+
+		if (!ent->valid)
+			continue;
+		if (ent->inode != req->inode || ent->band != band)
+			continue;
+		ent->stamp = ++s->read_stream_affinity_clock;
+		return ent->worker_id % HELPER_READ_WORKERS;
+	}
+
+	for (i = 0; i < HELPER_READ_STREAM_AFFINITY_MAX; i++) {
+		struct read_stream_affinity_entry *ent = &s->read_stream_affinity[i];
+
+		if (!victim || !victim->valid ||
+		    (ent->valid && ent->stamp < victim->stamp) ||
+		    !ent->valid) {
+			victim = ent;
+			if (!ent->valid)
+				break;
+		}
+	}
+
+	if (!victim)
+		return 0;
+
+	memset(victim, 0, sizeof(*victim));
+	victim->valid = true;
+	victim->inode = req->inode;
+	victim->band = band;
+	victim->worker_id = s->read_stream_next_worker++ % HELPER_READ_WORKERS;
+	victim->stamp = ++s->read_stream_affinity_clock;
+	return victim->worker_id;
 }
 
 static void session_reset_read_meta_cache(struct helper_session *s)
@@ -364,11 +483,20 @@ static void read_state_reset_prefetch(struct read_state *rs)
 	rs->seq_bytes = 0;
 }
 
+static void read_state_reset_stripe(struct read_state *rs)
+{
+	rs->stripe_band = 0;
+	rs->stripe_base_chunk = 0;
+	rs->stripe_chunk_count = 0;
+	memset(rs->stripe_meta, 0, sizeof(rs->stripe_meta));
+}
+
 static void read_state_destroy(struct read_state *rs)
 {
 	read_state_drop_cs(rs);
 	read_state_reset_scoreboard(rs);
 	read_state_reset_prefetch(rs);
+	read_state_reset_stripe(rs);
 	rs->meta_valid = false;
 	rs->meta_status = 0;
 	rs->inode = 0;
@@ -1966,18 +2094,63 @@ static int session_getattr(struct helper_session *s, uint32_t inode,
 	uint32_t msgid = next_msgid(s);
 	uint8_t status;
 	uint64_t now_ms;
+	struct getattr_cache_entry *slot = NULL;
+	bool leader = false;
 	int ret;
+	size_t i;
 
 	now_ms = monotonic_ms();
 	pthread_mutex_lock(&s->getattr_cache_mu);
-	if (s->getattr_cache_valid &&
-	    s->getattr_cache_inode == inode &&
-	    s->getattr_cache_uid == uid &&
-	    s->getattr_cache_gid == gid &&
-	    s->getattr_cache_expires_ms >= now_ms) {
-		*out = s->getattr_cache_attr;
-		pthread_mutex_unlock(&s->getattr_cache_mu);
-		return 0;
+	for (;;) {
+		slot = NULL;
+		for (i = 0; i < HELPER_GETATTR_CACHE_MAX; i++) {
+			struct getattr_cache_entry *ent = &s->getattr_cache[i];
+
+			if (!ent->valid)
+				continue;
+			if (ent->inode != inode || ent->uid != uid || ent->gid != gid)
+				continue;
+			slot = ent;
+			break;
+		}
+		if (slot && !slot->pending && slot->expires_ms >= now_ms) {
+			slot->stamp = ++s->getattr_cache_clock;
+			*out = slot->attr;
+			pthread_mutex_unlock(&s->getattr_cache_mu);
+			return 0;
+		}
+		if (slot && slot->pending) {
+			pthread_cond_wait(&s->getattr_cache_cv, &s->getattr_cache_mu);
+			now_ms = monotonic_ms();
+			continue;
+		}
+		if (!slot) {
+			struct getattr_cache_entry *victim = NULL;
+
+			for (i = 0; i < HELPER_GETATTR_CACHE_MAX; i++) {
+				struct getattr_cache_entry *ent = &s->getattr_cache[i];
+
+				if (!victim || !victim->valid ||
+				    (!ent->valid) ||
+				    (ent->valid && ent->stamp < victim->stamp)) {
+					victim = ent;
+					if (!ent->valid)
+						break;
+				}
+			}
+			slot = victim;
+		}
+		if (slot) {
+			memset(slot, 0, sizeof(*slot));
+			slot->valid = true;
+			slot->pending = true;
+			slot->inode = inode;
+			slot->uid = uid;
+			slot->gid = gid;
+			slot->stamp = ++s->getattr_cache_clock;
+			leader = true;
+		}
+		break;
 	}
 	pthread_mutex_unlock(&s->getattr_cache_mu);
 
@@ -1994,6 +2167,13 @@ static int session_getattr(struct helper_session *s, uint32_t inode,
 			 MATOCL_FUSE_GETATTR, &rsp, &rsp_len);
 	if (ret) {
 		vlog("getattr: master_rpc failed ret=%d", ret);
+		if (leader) {
+			pthread_mutex_lock(&s->getattr_cache_mu);
+			if (slot)
+				memset(slot, 0, sizeof(*slot));
+			pthread_cond_broadcast(&s->getattr_cache_cv);
+			pthread_mutex_unlock(&s->getattr_cache_mu);
+		}
 		return ret;
 	}
 
@@ -2004,9 +2184,23 @@ static int session_getattr(struct helper_session *s, uint32_t inode,
 		free(rsp);
 		if (ret) {
 			vlog("getattr: parse_simple_status failed ret=%d", ret);
+			if (leader) {
+				pthread_mutex_lock(&s->getattr_cache_mu);
+				if (slot)
+					memset(slot, 0, sizeof(*slot));
+				pthread_cond_broadcast(&s->getattr_cache_cv);
+				pthread_mutex_unlock(&s->getattr_cache_mu);
+			}
 			return ret;
 		}
 		vlog("getattr: master returned status=%u (MFS error)", (unsigned)status);
+		if (leader) {
+			pthread_mutex_lock(&s->getattr_cache_mu);
+			if (slot)
+				memset(slot, 0, sizeof(*slot));
+			pthread_cond_broadcast(&s->getattr_cache_cv);
+			pthread_mutex_unlock(&s->getattr_cache_mu);
+		}
 		return status;
 	}
 
@@ -2014,6 +2208,13 @@ static int session_getattr(struct helper_session *s, uint32_t inode,
 	if (ret) {
 		free(rsp);
 		vlog("getattr: parse_msgid failed ret=%d", ret);
+		if (leader) {
+			pthread_mutex_lock(&s->getattr_cache_mu);
+			if (slot)
+				memset(slot, 0, sizeof(*slot));
+			pthread_cond_broadcast(&s->getattr_cache_cv);
+			pthread_mutex_unlock(&s->getattr_cache_mu);
+		}
 		return ret;
 	}
 
@@ -2023,14 +2224,21 @@ static int session_getattr(struct helper_session *s, uint32_t inode,
 	vlog("getattr: parse_attr_record ret=%d rsp_len=%u attr_size=%d",
 	     ret, rsp_len, s->attr_size);
 	free(rsp);
-	if (!ret) {
+	if (leader) {
 		pthread_mutex_lock(&s->getattr_cache_mu);
-		s->getattr_cache_valid = true;
-		s->getattr_cache_inode = inode;
-		s->getattr_cache_uid = uid;
-		s->getattr_cache_gid = gid;
-		s->getattr_cache_attr = *out;
-		s->getattr_cache_expires_ms = monotonic_ms() + HELPER_GETATTR_CACHE_TTL_MS;
+		if (!ret) {
+			slot->valid = true;
+			slot->pending = false;
+			slot->inode = inode;
+			slot->uid = uid;
+			slot->gid = gid;
+			slot->attr = *out;
+			slot->expires_ms = monotonic_ms() + HELPER_GETATTR_CACHE_TTL_MS;
+			slot->stamp = ++s->getattr_cache_clock;
+		} else if (slot) {
+			memset(slot, 0, sizeof(*slot));
+		}
+		pthread_cond_broadcast(&s->getattr_cache_cv);
 		pthread_mutex_unlock(&s->getattr_cache_mu);
 	}
 	return ret;
@@ -3187,6 +3395,138 @@ static void read_state_invalidate(struct read_state *rs)
 	read_state_drop_cs(rs);
 	read_state_reset_scoreboard(rs);
 	read_state_reset_prefetch(rs);
+	read_state_reset_stripe(rs);
+}
+
+static void read_state_prepare_stripe(struct read_state *rs,
+				      uint32_t inode, uint32_t chunk_idx)
+{
+	uint32_t chunks_per_band = mfs_read_chunks_per_band();
+	uint64_t band = mfs_read_chunk_band(chunk_idx);
+	uint32_t base = (chunk_idx / chunks_per_band) * chunks_per_band;
+
+	if (rs->inode == inode &&
+	    rs->stripe_chunk_count > 0 &&
+	    rs->stripe_band == band &&
+	    chunk_idx >= rs->stripe_base_chunk &&
+	    chunk_idx < rs->stripe_base_chunk + rs->stripe_chunk_count)
+		return;
+
+	read_state_reset_stripe(rs);
+	rs->stripe_band = band;
+	rs->stripe_base_chunk = base;
+	rs->stripe_chunk_count = chunks_per_band;
+}
+
+static struct read_stripe_meta_entry *read_state_stripe_slot(struct read_state *rs,
+						     uint32_t inode,
+						     uint32_t chunk_idx)
+{
+	uint32_t slot;
+
+	read_state_prepare_stripe(rs, inode, chunk_idx);
+	if (rs->stripe_chunk_count == 0 || chunk_idx < rs->stripe_base_chunk)
+		return NULL;
+	slot = chunk_idx - rs->stripe_base_chunk;
+	if (slot >= rs->stripe_chunk_count || slot >= HELPER_READ_STRIPE_META_MAX)
+		return NULL;
+	return &rs->stripe_meta[slot];
+}
+
+static void read_state_store_stripe_meta(struct read_state *rs,
+					 uint32_t inode,
+					 uint32_t chunk_idx,
+					 int status,
+					 const struct chunk_meta *m)
+{
+	struct read_stripe_meta_entry *ent;
+
+	ent = read_state_stripe_slot(rs, inode, chunk_idx);
+	if (!ent)
+		return;
+	ent->valid = true;
+	ent->chunk_idx = chunk_idx;
+	ent->status = status;
+	if (status == 0 && m)
+		ent->meta = *m;
+	else
+		memset(&ent->meta, 0, sizeof(ent->meta));
+}
+
+static bool read_state_lookup_stripe_meta(struct read_state *rs,
+					  uint32_t inode,
+					  uint32_t chunk_idx,
+					  struct chunk_meta *m,
+					  int *status_out)
+{
+	struct read_stripe_meta_entry *ent;
+
+	ent = read_state_stripe_slot(rs, inode, chunk_idx);
+	if (!ent || !ent->valid || ent->chunk_idx != chunk_idx)
+		return false;
+	*status_out = ent->status;
+	if (ent->status == 0 && m)
+		*m = ent->meta;
+	return true;
+}
+
+static int read_state_fetch_one_chunk_meta(struct helper_session *s,
+					   struct read_state *rs,
+					   uint32_t inode,
+					   uint32_t chunk_idx,
+					   struct chunk_meta *m)
+{
+	int cached_status = 0;
+	int ret;
+
+	if (session_lookup_read_meta_cache(s, inode, chunk_idx, m, &cached_status)) {
+		read_state_store_stripe_meta(rs, inode, chunk_idx, cached_status,
+					     cached_status ? NULL : m);
+		return cached_status;
+	}
+
+	if (!session_acquire_read_meta_fetch(s, inode, chunk_idx) &&
+	    session_lookup_read_meta_cache(s, inode, chunk_idx, m, &cached_status)) {
+		read_state_store_stripe_meta(rs, inode, chunk_idx, cached_status,
+					     cached_status ? NULL : m);
+		return cached_status;
+	}
+
+	ret = session_read_chunk_meta(s, inode, chunk_idx, m);
+	if (ret) {
+		if (ret == MFS_ERROR_NOCHUNKSERVERS || ret == MFS_ERROR_NOCHUNK) {
+			session_store_read_meta_cache(s, inode, chunk_idx, ret, NULL);
+			read_state_store_stripe_meta(rs, inode, chunk_idx, ret, NULL);
+		} else {
+			session_abort_read_meta_fetch(s, inode, chunk_idx);
+		}
+		return ret;
+	}
+
+	session_store_read_meta_cache(s, inode, chunk_idx, 0, m);
+	read_state_store_stripe_meta(rs, inode, chunk_idx, 0, m);
+	return 0;
+}
+
+static void read_state_fill_stripe_plan(struct helper_session *s,
+					struct read_state *rs,
+					uint32_t inode,
+					uint32_t chunk_idx)
+{
+	struct chunk_meta meta;
+	uint32_t i;
+
+	read_state_prepare_stripe(rs, inode, chunk_idx);
+	for (i = 0; i < rs->stripe_chunk_count && i < HELPER_READ_STRIPE_META_MAX; i++) {
+		uint32_t stripe_chunk_idx = rs->stripe_base_chunk + i;
+		struct read_stripe_meta_entry *ent = &rs->stripe_meta[i];
+
+		if (ent->valid && ent->chunk_idx == stripe_chunk_idx)
+			continue;
+		if (read_state_fetch_one_chunk_meta(s, rs, inode, stripe_chunk_idx, &meta) &&
+		    stripe_chunk_idx == chunk_idx)
+			break;
+	}
 }
 
 static int read_state_get_chunk_meta(struct helper_session *s,
@@ -3206,60 +3546,24 @@ static int read_state_get_chunk_meta(struct helper_session *s,
 		return 0;
 	}
 
-	if (session_lookup_read_meta_cache(s, inode, chunk_idx, m, &cached_status)) {
-		read_state_reset_scoreboard(rs);
-		rs->meta_valid = true;
-		rs->meta_status = cached_status;
-		rs->inode = inode;
-		rs->chunk_idx = chunk_idx;
-		if (cached_status) {
-			memset(&rs->meta, 0, sizeof(rs->meta));
-			return cached_status;
-		}
-		rs->meta = *m;
-		session_schedule_read_ahead(s, inode, chunk_idx + 1);
-		return 0;
-	}
-
-	if (!session_acquire_read_meta_fetch(s, inode, chunk_idx) &&
-	    session_lookup_read_meta_cache(s, inode, chunk_idx, m, &cached_status)) {
-		read_state_reset_scoreboard(rs);
-		rs->meta_valid = true;
-		rs->meta_status = cached_status;
-		rs->inode = inode;
-		rs->chunk_idx = chunk_idx;
-		if (cached_status) {
-			memset(&rs->meta, 0, sizeof(rs->meta));
-			return cached_status;
-		}
-		rs->meta = *m;
-		session_schedule_read_ahead(s, inode, chunk_idx + 1);
-		return 0;
-	}
-
 	read_state_reset_scoreboard(rs);
-	ret = session_read_chunk_meta(s, inode, chunk_idx, m);
-	if (ret) {
-		if (ret == MFS_ERROR_NOCHUNKSERVERS || ret == MFS_ERROR_NOCHUNK) {
-			session_store_read_meta_cache(s, inode, chunk_idx, ret, NULL);
-			rs->meta_valid = true;
-			rs->meta_status = ret;
-			rs->inode = inode;
-			rs->chunk_idx = chunk_idx;
-			memset(&rs->meta, 0, sizeof(rs->meta));
-		} else {
-			session_abort_read_meta_fetch(s, inode, chunk_idx);
-		}
-		return ret;
+	if (read_state_lookup_stripe_meta(rs, inode, chunk_idx, m, &cached_status)) {
+		ret = cached_status;
+	} else {
+		ret = read_state_fetch_one_chunk_meta(s, rs, inode, chunk_idx, m);
+		if (!ret)
+			read_state_fill_stripe_plan(s, rs, inode, chunk_idx);
 	}
 
 	rs->meta_valid = true;
-	rs->meta_status = 0;
+	rs->meta_status = ret;
 	rs->inode = inode;
 	rs->chunk_idx = chunk_idx;
+	if (ret) {
+		memset(&rs->meta, 0, sizeof(rs->meta));
+		return ret;
+	}
 	rs->meta = *m;
-	session_store_read_meta_cache(s, inode, chunk_idx, 0, m);
-	session_schedule_read_ahead(s, inode, chunk_idx + 1);
 	return 0;
 }
 
@@ -3791,8 +4095,20 @@ static int read_state_fetch_window(struct helper_session *s,
 							 got_out);
 				if (ret == 0)
 					return 0;
+				vlog("read_fetch: preferred replica failed inode=%u chunk=%u chunkid=%llu off=%u len=%u ip=%u port=%u ret=%d attempt=%u",
+				     inode, chunk_idx,
+				     (unsigned long long)m->chunkid,
+				     chunk_off, attempt_fetch_len,
+				     preferred->ip, preferred->port,
+				     ret, attempt);
 			} else {
 				ret = csfd;
+				vlog("read_fetch: preferred connect failed inode=%u chunk=%u chunkid=%llu off=%u len=%u ip=%u port=%u ret=%d attempt=%u",
+				     inode, chunk_idx,
+				     (unsigned long long)m->chunkid,
+				     chunk_off, attempt_fetch_len,
+				     preferred->ip, preferred->port,
+				     ret, attempt);
 			}
 			read_state_drop_cs(rs);
 		}
@@ -3814,6 +4130,12 @@ static int read_state_fetch_window(struct helper_session *s,
 						 attempt_fetch_len, fetch_buf, got_out);
 			if (ret == 0)
 				return 0;
+			vlog("read_fetch: alt replica failed inode=%u chunk=%u chunkid=%llu off=%u len=%u ip=%u port=%u ret=%d attempt=%u",
+			     inode, chunk_idx,
+			     (unsigned long long)m->chunkid,
+			     chunk_off, attempt_fetch_len,
+			     loc->ip, loc->port,
+			     ret, attempt);
 			read_state_drop_cs(rs);
 		}
 
@@ -4813,6 +5135,7 @@ static int enqueue_read_job(struct helper_session *s,
 	size_t i;
 	size_t free_slot = HELPER_READ_JOB_QUEUE_MAX;
 	uint8_t *payload_copy = NULL;
+	uint32_t preferred_worker = 0;
 
 	if (payload_len) {
 		payload_copy = malloc(payload_len);
@@ -4821,6 +5144,9 @@ static int enqueue_read_job(struct helper_session *s,
 		memcpy(payload_copy, payload, payload_len);
 	}
 	pthread_mutex_lock(&s->read_job_mu);
+	if (payload_len >= sizeof(struct mfs_ctrl_read_req))
+		preferred_worker = session_select_read_worker(
+			s, (const struct mfs_ctrl_read_req *)payload_copy);
 	for (;;) {
 		for (i = 0; i < HELPER_READ_JOB_QUEUE_MAX; i++) {
 			if (!s->read_jobs[i].valid) {
@@ -4841,6 +5167,7 @@ static int enqueue_read_job(struct helper_session *s,
 	s->read_jobs[free_slot].hdr = *hdr;
 	s->read_jobs[free_slot].payload = payload_copy;
 	s->read_jobs[free_slot].payload_len = payload_len;
+	s->read_jobs[free_slot].preferred_worker = preferred_worker;
 	pthread_cond_broadcast(&s->read_job_cv);
 	pthread_mutex_unlock(&s->read_job_mu);
 	return 0;
@@ -4848,8 +5175,12 @@ static int enqueue_read_job(struct helper_session *s,
 
 static void *read_worker_thread_main(void *arg)
 {
-	struct helper_session *s = arg;
+	struct read_worker_arg *wa = arg;
+	struct helper_session *s = wa->session;
+	uint32_t worker_id = wa->worker_id;
 	struct read_state rs;
+	uint32_t last_inode = 0;
+	uint64_t last_band = UINT64_MAX;
 
 	read_state_init(&rs);
 	for (;;) {
@@ -4862,14 +5193,29 @@ static void *read_worker_thread_main(void *arg)
 
 		pthread_mutex_lock(&s->read_job_mu);
 		for (;;) {
+			ssize_t fallback_idx = -1;
+
 			if (s->read_worker_stop)
 				break;
 			for (i = 0; i < HELPER_READ_JOB_QUEUE_MAX; i++) {
+				if (!s->read_jobs[i].valid)
+					continue;
+				if (s->read_jobs[i].preferred_worker != worker_id) {
+					if (fallback_idx < 0)
+						fallback_idx = (ssize_t)i;
+					continue;
+				}
+				job = s->read_jobs[i];
+				memset(&s->read_jobs[i], 0, sizeof(s->read_jobs[i]));
+				pthread_cond_broadcast(&s->read_job_cv);
+				break;
+			}
+			if (!job.valid && fallback_idx >= 0) {
+				i = (size_t)fallback_idx;
 				if (s->read_jobs[i].valid) {
 					job = s->read_jobs[i];
 					memset(&s->read_jobs[i], 0, sizeof(s->read_jobs[i]));
 					pthread_cond_broadcast(&s->read_job_cv);
-					break;
 				}
 			}
 			if (job.valid || s->read_worker_stop)
@@ -4884,8 +5230,17 @@ static void *read_worker_thread_main(void *arg)
 		if (job.payload_len < sizeof(struct mfs_ctrl_read_req)) {
 			status = -EINVAL;
 		} else {
-			status = read_state_read_data(s, &rs,
-					(const struct mfs_ctrl_read_req *)job.payload,
+			const struct mfs_ctrl_read_req *req =
+				(const struct mfs_ctrl_read_req *)job.payload;
+			uint64_t band = req->offset >> HELPER_READ_STREAM_BAND_SHIFT;
+
+			if (last_inode != req->inode || last_band != band) {
+				read_state_destroy(&rs);
+				read_state_init(&rs);
+				last_inode = req->inode;
+				last_band = band;
+			}
+			status = read_state_read_data(s, &rs, req,
 					&rsp_payload, &rsp_len);
 		}
 
@@ -4912,11 +5267,17 @@ static int session_start_read_workers(struct helper_session *s)
 	pthread_mutex_lock(&s->read_job_mu);
 	s->read_worker_stop = false;
 	memset(s->read_jobs, 0, sizeof(s->read_jobs));
+	memset(s->read_stream_affinity, 0, sizeof(s->read_stream_affinity));
+	s->read_stream_affinity_clock = 0;
+	s->read_stream_next_worker = 0;
 	pthread_mutex_unlock(&s->read_job_mu);
 
 	for (i = 0; i < HELPER_READ_WORKERS; i++) {
+		s->read_worker_args[i].session = s;
+		s->read_worker_args[i].worker_id = (uint32_t)i;
 		int ret = pthread_create(&s->read_workers[i], NULL,
-					 read_worker_thread_main, s);
+					 read_worker_thread_main,
+					 &s->read_worker_args[i]);
 		if (ret) {
 			pthread_mutex_lock(&s->read_job_mu);
 			s->read_worker_stop = true;
@@ -5051,6 +5412,7 @@ int main(int argc, char **argv)
 	pthread_mutex_init(&session.read_job_mu, NULL);
 	pthread_cond_init(&session.read_job_cv, NULL);
 	pthread_mutex_init(&session.getattr_cache_mu, NULL);
+	pthread_cond_init(&session.getattr_cache_cv, NULL);
 	pthread_mutex_init(&session.ctrl_write_mu, NULL);
 	session.master_last_nop = time(NULL);
 	session_start_read_prefetch_thread(&session);
@@ -5144,6 +5506,7 @@ int main(int argc, char **argv)
 	pthread_mutex_destroy(&session.read_job_mu);
 	pthread_cond_destroy(&session.read_job_cv);
 	pthread_mutex_destroy(&session.getattr_cache_mu);
+	pthread_cond_destroy(&session.getattr_cache_cv);
 	pthread_mutex_destroy(&session.ctrl_write_mu);
 	return 0;
 }
