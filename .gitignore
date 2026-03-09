@@ -31,3 +31,53 @@ autom4te.cache/
 
 # Local-only large artifacts
 extended/mfs-direct-rs/ubuntu-24.04.4-live-server-amd64.iso
+
+# Local temp and scratch
+tmp/
+/II,t,len(p))+p
+/II,t,len(p))*
+mfscommon/.dirstamp
+
+# Generated MooseFS sample/runtime configs
+mfsdata/mfschunkserver.cfg
+mfsdata/mfsgui.cfg
+mfsdata/mfsmaster.cfg
+mfsdata/mfsmetalogger.cfg
+mfsdata/mfsmount.cfg
+
+# Built top-level MooseFS binaries and scripts
+mfsmaster/mfsmaster
+mfsmaster/mfsstatsdump
+mfsmaster/mfssupervisor
+mfschunkserver/mfschunkdbdump
+mfschunkserver/mfschunktool
+mfschunkserver/mfscsstatsdump
+mfsmetalogger/mfsmetalogger
+mfsgui/mfsgui
+mfsmetatools/mfsmetadirinfo
+mfsmetatools/mfsmetadump
+mfsmetatools/mfsmetasearch
+mfsscripts/chart.cgi
+mfsscripts/chartdata.cgi
+mfsscripts/mfscli
+mfstests/mfstest_bitops
+mfstests/mfstest_clocks
+mfstests/mfstest_crc32
+mfstests/mfstest_datapack
+mfstests/mfstest_delayrun
+
+# Built client-side MooseFS tools
+mfsclient/mfsarchive
+mfsclient/mfsbdev
+mfsclient/mfsdiagtools
+mfsclient/mfseattr
+mfsclient/mfsfacl
+mfsclient/mfsmount
+mfsclient/mfspatadmin
+mfsclient/mfsquota
+mfsclient/mfsscadmin
+mfsclient/mfssclass
+mfsclient/mfssnapshots
+mfsclient/mfstrashretention
+mfsclient/mfstrashtime
+mfsclient/mfstrashtool

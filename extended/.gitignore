@@ -21,3 +21,8 @@ Module.symvers
 *.swo
 *~
 .DS_Store
+
+# Local benchmark and helper outputs
+mfs-kmod/benchmarks/
+mfs-kmod/mfskmod-helper
+qemu-mfs/proxmox-icon-compare-before.png
