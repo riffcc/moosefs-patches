@@ -4,7 +4,7 @@ use std::net::TcpStream;
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    attr_record_len, attr_size, attr_type, crc32_update, decode_u16_be, decode_u32_be,
+    attr_size, attr_type, crc32_update, decode_u16_be, decode_u32_be,
     decode_u64_be, expect_msgid, expect_simple_status, read_packet, response_status, roundtrip,
     write_packet, version_int, BLOCK_SIZE, CHUNKOPFLAG_CANMODTIME, CHUNK_SIZE,
     CLTOMA_FUSE_CREATE, CLTOMA_FUSE_GETATTR, CLTOMA_FUSE_LOOKUP, CLTOMA_FUSE_MKDIR,
@@ -558,6 +558,367 @@ impl Client<QuicStreamMaster> {
         let mut client = Self::connect(master_addr, options.clone())?;
         client.register_session(&options)?;
         Ok(client)
+    }
+
+    pub fn read_all(&mut self, path: &str) -> Result<Vec<u8>> {
+        let file = self.open_file(path)?;
+        let file_size = file.size;
+        if file_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut out = vec![0u8; file_size as usize];
+        self.read_at(&file, 0, &mut out)?;
+        Ok(out)
+    }
+
+    pub fn write_all(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
+        let mut cursor = std::io::Cursor::new(bytes);
+        self.write_from_reader(path, bytes.len() as u64, &mut cursor)
+    }
+
+    pub fn write_from_reader<R: Read>(&mut self, path: &str, size: u64, reader: &mut R) -> Result<()> {
+        validate_absolute_path(path)?;
+        let inode = self.ensure_file(path, size)?;
+        if size == 0 {
+            return Ok(());
+        }
+
+        let master_version = self
+            .session
+            .as_ref()
+            .ok_or(Error::Protocol("session not registered"))?
+            .master_version;
+        let mut written = 0u64;
+        let mut chunk_session = None;
+
+        while written < size {
+            let file_offset = written;
+            let chunk_index = (file_offset / CHUNK_SIZE) as u32;
+            let chunk_offset = (file_offset % CHUNK_SIZE) as u32;
+            let remaining = (size - written) as usize;
+            let to_write = remaining.min((CHUNK_SIZE as usize) - (chunk_offset as usize));
+            let mut chunk_buf = vec![0u8; to_write];
+            reader.read_exact(&mut chunk_buf)?;
+
+            let chunk_location = self.master_write_chunk(inode as u32, chunk_index)?;
+            self.chunkserver_write(
+                &chunk_location,
+                chunk_offset,
+                &chunk_buf,
+                &mut chunk_session,
+            )?;
+            self.master_write_chunk_end(
+                master_version,
+                inode as u32,
+                chunk_index,
+                chunk_location.chunk_id,
+                size,
+                chunk_offset,
+                to_write as u32,
+            )?;
+
+            written += to_write as u64;
+        }
+
+        Ok(())
+    }
+
+    pub fn open_file(&mut self, path: &str) -> Result<OpenFile> {
+        let inode = self.lookup_path(path)?;
+        let (_, file_size, file_type) = self.getattr(inode as u32)?;
+        if file_type != TYPE_FILE {
+            return Err(Error::Protocol("path does not resolve to a regular file"));
+        }
+        Ok(OpenFile {
+            path: path.to_string(),
+            inode: inode as u32,
+            size: file_size,
+        })
+    }
+
+    pub fn ensure_file_len(&mut self, path: &str, size: u64) -> Result<OpenFile> {
+        let inode = self.ensure_file(path, size)? as u32;
+        self.read_chunk_cache.retain(|(cached_inode, _), _| *cached_inode != inode);
+        self.write_chunk_cache
+            .retain(|(cached_inode, _), _| *cached_inode != inode);
+        Ok(OpenFile {
+            path: path.to_string(),
+            inode,
+            size,
+        })
+    }
+
+    pub fn read_at(&mut self, file: &OpenFile, offset: u64, out: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(out.len() as u64)
+            .ok_or(Error::InvalidInput("read range overflows"))?;
+        if end > file.size {
+            return Err(Error::InvalidInput("read range exceeds file size"));
+        }
+
+        let mut filled = 0usize;
+        while filled < out.len() {
+            let file_offset = offset + filled as u64;
+            let chunk_index = (file_offset / CHUNK_SIZE) as u32;
+            let chunk_offset = (file_offset % CHUNK_SIZE) as u32;
+            let remaining = out.len() - filled;
+            let to_read = remaining.min((CHUNK_SIZE as usize) - chunk_offset as usize);
+            let chunk = self.master_read_chunk_cached(file.inode, chunk_index)?;
+            self.chunkserver_read(&chunk, chunk_offset, &mut out[filled..filled + to_read])?;
+            filled += to_read;
+        }
+
+        Ok(())
+    }
+
+    pub fn write_at(&mut self, file: &OpenFile, offset: u64, bytes: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(Error::InvalidInput("write range overflows"))?;
+        if end > file.size {
+            return Err(Error::InvalidInput("write range exceeds file size"));
+        }
+
+        let master_version = self
+            .session
+            .as_ref()
+            .ok_or(Error::Protocol("session not registered"))?
+            .master_version;
+        let mut written = 0usize;
+        let mut chunk_session = None;
+
+        while written < bytes.len() {
+            let file_offset = offset + written as u64;
+            let chunk_index = (file_offset / CHUNK_SIZE) as u32;
+            let chunk_offset = (file_offset % CHUNK_SIZE) as u32;
+            let remaining = bytes.len() - written;
+            let to_write = remaining.min((CHUNK_SIZE as usize) - chunk_offset as usize);
+            self.read_chunk_cache.remove(&(file.inode, chunk_index));
+            let chunk_location = self.master_write_chunk_cached(file.inode, chunk_index)?;
+            self.chunkserver_write(
+                &chunk_location,
+                chunk_offset,
+                &bytes[written..written + to_write],
+                &mut chunk_session,
+            )?;
+            self.master_write_chunk_end(
+                master_version,
+                file.inode,
+                chunk_index,
+                chunk_location.chunk_id,
+                file.size,
+                chunk_offset,
+                to_write as u32,
+            )?;
+            written += to_write;
+        }
+
+        Ok(())
+    }
+
+    fn master_read_chunk_cached(&mut self, inode: u32, chunk_index: u32) -> Result<ChunkLocation> {
+        if let Some(chunk) = self.read_chunk_cache.get(&(inode, chunk_index)) {
+            return Ok(chunk.clone());
+        }
+        let chunk = self.master_read_chunk(inode, chunk_index)?;
+        self.read_chunk_cache
+            .insert((inode, chunk_index), chunk.clone());
+        Ok(chunk)
+    }
+
+    fn master_write_chunk_cached(&mut self, inode: u32, chunk_index: u32) -> Result<ChunkLocation> {
+        if let Some(chunk) = self.write_chunk_cache.get(&(inode, chunk_index)) {
+            return Ok(chunk.clone());
+        }
+        let chunk = self.master_write_chunk(inode, chunk_index)?;
+        self.write_chunk_cache
+            .insert((inode, chunk_index), chunk.clone());
+        Ok(chunk)
+    }
+
+    fn chunkserver_read(
+        &mut self,
+        chunk: &ChunkLocation,
+        chunk_offset: u32,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let replica = chunk
+            .replicas
+            .first()
+            .ok_or(Error::Protocol("chunk metadata has no replicas"))?;
+        let protocol_id = if replica.chunkserver_version >= version_int(1, 7, 32) {
+            Some(1)
+        } else {
+            None
+        };
+        let stream = chunkserver_read_session(&mut self.read_session, replica, protocol_id)?;
+
+        let mut request = Vec::with_capacity(21);
+        if let Some(protocol_id) = protocol_id {
+            request.push(protocol_id);
+        }
+        request.extend_from_slice(&chunk.chunk_id.to_be_bytes());
+        request.extend_from_slice(&chunk.chunk_version.to_be_bytes());
+        request.extend_from_slice(&chunk_offset.to_be_bytes());
+        request.extend_from_slice(&(out.len() as u32).to_be_bytes());
+        write_packet(stream, CLTOCS_READ, &request)?;
+
+        let mut total = 0usize;
+        while total < out.len() {
+            let packet = read_packet(stream)?;
+            if packet.packet_type == CSTOCL_READ_STATUS {
+                if packet.payload.len() < 9 {
+                    return Err(Error::Protocol("short read status"));
+                }
+                let status = packet.payload[8];
+                if status != 0 {
+                    return Err(Error::MoosefsStatus {
+                        op: "chunkserver read",
+                        status,
+                    });
+                }
+                return Ok(());
+            }
+
+            if packet.packet_type != CSTOCL_READ_DATA {
+                return Err(Error::Protocol("unexpected chunkserver read reply type"));
+            }
+            if packet.payload.len() < 20 {
+                return Err(Error::Protocol("short read data packet"));
+            }
+
+            let block = decode_u16_be(&packet.payload[8..10])? as u32;
+            let block_off = decode_u16_be(&packet.payload[10..12])? as u32;
+            let data_len = decode_u32_be(&packet.payload[12..16])? as usize;
+            let remote_off = block * BLOCK_SIZE + block_off;
+            if packet.payload.len() < 20 + data_len {
+                return Err(Error::Protocol("truncated read data packet"));
+            }
+
+            let copy_off = (chunk_offset as usize).saturating_sub(remote_off as usize);
+            if copy_off >= data_len {
+                continue;
+            }
+
+            let copy_len = (data_len - copy_off).min(out.len() - total);
+            out[total..total + copy_len]
+                .copy_from_slice(&packet.payload[20 + copy_off..20 + copy_off + copy_len]);
+            total += copy_len;
+        }
+
+        loop {
+            let packet = read_packet(stream)?;
+            if packet.packet_type != CSTOCL_READ_STATUS {
+                continue;
+            }
+            if packet.payload.len() < 9 {
+                return Err(Error::Protocol("short read status"));
+            }
+            let status = packet.payload[8];
+            if status != 0 {
+                return Err(Error::MoosefsStatus {
+                    op: "chunkserver read",
+                    status,
+                });
+            }
+            return Ok(());
+        }
+    }
+
+    fn chunkserver_write(
+        &mut self,
+        chunk: &ChunkLocation,
+        chunk_offset: u32,
+        bytes: &[u8],
+        session: &mut Option<ChunkWriteSession>,
+    ) -> Result<()> {
+        let replica = chunk
+            .replicas
+            .first()
+            .ok_or(Error::Protocol("chunk metadata has no replicas"))?;
+        let protocol_id = if replica.chunkserver_version >= version_int(1, 7, 32) {
+            Some(if self.experimental_ooo_write_acks { 0x81 } else { 0x01 })
+        } else {
+            None
+        };
+        let stream = chunkserver_write_session(session, replica, protocol_id)?;
+
+        let mut start = Vec::with_capacity(13 + chunk.replicas.len().saturating_sub(1) * 6);
+        if let Some(protocol_id) = protocol_id {
+            start.push(protocol_id);
+        }
+        start.extend_from_slice(&chunk.chunk_id.to_be_bytes());
+        start.extend_from_slice(&chunk.chunk_version.to_be_bytes());
+        for next_replica in chunk.replicas.iter().skip(1) {
+            let ip = parse_ipv4_host(&next_replica.host)?;
+            start.extend_from_slice(&ip.to_be_bytes());
+            start.extend_from_slice(&next_replica.port.to_be_bytes());
+        }
+        write_packet(stream, CLTOCS_WRITE, &start)?;
+        let init_status = recv_write_status(stream, chunk.chunk_id)?;
+        if init_status.write_id != 0 {
+            return Err(Error::ProtocolDetail(format!(
+                "expected initial write status id 0, got {}",
+                init_status.write_id
+            )));
+        }
+
+        let mut sent = 0usize;
+        let mut write_id = 1u32;
+        let mut in_flight = BTreeMap::new();
+        let mut confirmed = ConfirmedRanges::default();
+        let required = ByteRange::new(chunk_offset, chunk_offset + bytes.len() as u32);
+        let max_in_flight = self.max_in_flight_write_fragments.max(1);
+        while sent < bytes.len() || !in_flight.is_empty() {
+            while sent < bytes.len() && in_flight.len() < max_in_flight {
+                let off = chunk_offset + sent as u32;
+                let block = (off / BLOCK_SIZE) as u16;
+                let block_offset = (off % BLOCK_SIZE) as u16;
+                let frag = (bytes.len() - sent).min((BLOCK_SIZE - block_offset as u32) as usize);
+                let fragment = &bytes[sent..sent + frag];
+
+                let mut payload = Vec::with_capacity(24 + frag);
+                payload.extend_from_slice(&chunk.chunk_id.to_be_bytes());
+                payload.extend_from_slice(&write_id.to_be_bytes());
+                payload.extend_from_slice(&block.to_be_bytes());
+                payload.extend_from_slice(&block_offset.to_be_bytes());
+                payload.extend_from_slice(&(frag as u32).to_be_bytes());
+                payload.extend_from_slice(&crc32_update(0, fragment).to_be_bytes());
+                payload.extend_from_slice(fragment);
+
+                write_packet(stream, CLTOCS_WRITE_DATA, &payload)?;
+                in_flight.insert(write_id, ByteRange::new(off, off + frag as u32));
+                sent += frag;
+                write_id = write_id.wrapping_add(1);
+            }
+
+            if in_flight.is_empty() {
+                continue;
+            }
+
+            let status = recv_write_status(stream, chunk.chunk_id)?;
+            if status.write_id == 0 {
+                return Err(Error::Protocol("unexpected extra initial write status"));
+            }
+            let Some(acked_range) = in_flight.remove(&status.write_id) else {
+                return Err(Error::ProtocolDetail(format!(
+                    "received write status for unknown write id {}",
+                    status.write_id
+                )));
+            };
+            confirmed.insert(acked_range);
+        }
+
+        if !confirmed.covers(required) {
+            return Err(Error::Protocol("confirmed write coverage is incomplete"));
+        }
+
+        let mut finish = Vec::with_capacity(12);
+        finish.extend_from_slice(&chunk.chunk_id.to_be_bytes());
+        finish.extend_from_slice(&chunk.chunk_version.to_be_bytes());
+        write_packet(stream, CLTOCS_WRITE_FINISH, &finish)?;
+        Ok(())
     }
 }
 
@@ -1160,7 +1521,24 @@ impl<S: Read + Write> Client<S> {
             return Err(Error::Protocol("short readdir reply"));
         }
 
-        parse_readdir_entries(&packet.payload[12..]).or_else(|_| parse_readdir_entries(&packet.payload[4..]))
+        let master_version = self
+            .session
+            .as_ref()
+            .ok_or(Error::Protocol("session not registered"))?
+            .master_version;
+        let attr_len = if master_version >= version_int(3, 0, 93)
+            && master_version != version_int(4, 0, 0)
+            && master_version != version_int(4, 0, 1)
+        {
+            36
+        } else {
+            35
+        };
+
+        match parse_readdir_entries(&packet.payload[12..], attr_len) {
+            Ok(entries) => Ok(entries),
+            Err(_) => parse_readdir_entries(&packet.payload[4..], attr_len),
+        }
     }
 
     fn open_check(&mut self, inode: u32, flags: u8) -> Result<()> {
@@ -1562,7 +1940,7 @@ fn normalize_master_addr(master_addr: &str) -> String {
     }
 }
 
-fn parse_readdir_entries(body: &[u8]) -> Result<Vec<DirEntry>> {
+fn parse_readdir_entries(body: &[u8], attr_len: usize) -> Result<Vec<DirEntry>> {
     let mut entries = Vec::new();
     let mut offset = 0usize;
 
@@ -1586,10 +1964,9 @@ fn parse_readdir_entries(body: &[u8]) -> Result<Vec<DirEntry>> {
         offset += 4;
 
         let attr = &body[offset..];
-        if attr.len() < 35 {
+        if attr.len() < attr_len {
             return Err(Error::Protocol("truncated readdir entry attr"));
         }
-        let attr_len = attr_record_len(attr);
         if attr.len() < attr_len {
             return Err(Error::Protocol("truncated readdir entry attr"));
         }
@@ -1856,7 +2233,7 @@ mod tests {
         attr[27..35].copy_from_slice(&99u64.to_be_bytes());
         body.extend_from_slice(&attr);
 
-        let entries = parse_readdir_entries(&body).unwrap();
+        let entries = parse_readdir_entries(&body, 35).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "foo");
         assert_eq!(entries[0].inode, 7);
