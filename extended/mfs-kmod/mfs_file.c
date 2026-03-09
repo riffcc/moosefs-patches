@@ -47,7 +47,12 @@ static int mfs_read_remote(struct inode *inode, loff_t offset, u32 size,
 		.inode = inode->i_ino,
 		.offset = offset,
 		.size = size,
-		.flags = 0,
+		/*
+		 * Carry a stable per-task stream hint so the helper can keep
+		 * sequential read identity attached to one logical lane instead
+		 * of inferring it from offsets alone under fanout.
+		 */
+		.flags = (u32)task_pid_nr(current),
 	};
 
 	return mfs_call_checked(MFS_CTRL_OP_READ, &req, sizeof(req), raw, raw_len);

@@ -121,14 +121,6 @@ struct read_prefetch_data_entry {
 	uint64_t stamp;
 };
 
-struct read_stream_affinity_entry {
-	bool valid;
-	uint32_t inode;
-	uint64_t band;
-	uint32_t worker_id;
-	uint64_t stamp;
-};
-
 struct getattr_cache_entry {
 	bool valid;
 	bool pending;
@@ -177,12 +169,27 @@ struct read_state {
 	struct read_stripe_meta_entry stripe_meta[HELPER_READ_STRIPE_META_MAX];
 };
 
+struct read_stream_ctx {
+	bool valid;
+	bool in_flight;
+	uint64_t stream_id;
+	uint32_t inode;
+	uint32_t stream_hint;
+	uint64_t band;
+	uint64_t last_offset;
+	uint64_t next_offset;
+	uint32_t worker_id;
+	uint64_t last_used_ms;
+	struct read_state rs;
+};
+
 struct read_job {
 	bool valid;
 	struct mfs_ctrl_hdr hdr;
 	uint8_t *payload;
 	uint32_t payload_len;
 	uint32_t preferred_worker;
+	uint64_t stream_id;
 };
 
 struct read_worker_arg {
@@ -249,9 +256,10 @@ struct helper_session {
 	pthread_mutex_t read_job_mu;
 	pthread_cond_t read_job_cv;
 	struct read_job read_jobs[HELPER_READ_JOB_QUEUE_MAX];
-	uint64_t read_stream_affinity_clock;
+	uint64_t read_stream_clock;
 	uint32_t read_stream_next_worker;
-	struct read_stream_affinity_entry read_stream_affinity[HELPER_READ_STREAM_AFFINITY_MAX];
+	uint64_t read_stream_next_id;
+	struct read_stream_ctx read_streams[HELPER_READ_STREAM_AFFINITY_MAX];
 	bool read_worker_running;
 	bool read_worker_stop;
 	pthread_mutex_t getattr_cache_mu;
@@ -304,8 +312,11 @@ static int read_state_read_data(struct helper_session *s,
 				struct read_state *rs,
 				const struct mfs_ctrl_read_req *req,
 				uint8_t **out, uint32_t *out_len);
-static uint32_t session_select_read_worker(struct helper_session *s,
-					   const struct mfs_ctrl_read_req *req);
+static struct read_stream_ctx *session_assign_read_stream(struct helper_session *s,
+							  const struct mfs_ctrl_read_req *req);
+static struct read_stream_ctx *session_get_read_stream(struct helper_session *s,
+						       uint64_t stream_id);
+static void session_reset_read_streams(struct helper_session *s);
 static inline uint64_t mfs_read_band(loff_t offset);
 static inline uint64_t mfs_read_chunk_band(uint32_t chunk_idx);
 static inline uint32_t mfs_read_chunks_per_band(void);
@@ -384,50 +395,96 @@ static inline uint32_t mfs_read_chunks_per_band(void)
 	return chunks;
 }
 
-static uint32_t session_select_read_worker(struct helper_session *s,
-					   const struct mfs_ctrl_read_req *req)
+static void session_reset_read_streams(struct helper_session *s)
 {
+	size_t i;
+
+	for (i = 0; i < HELPER_READ_STREAM_AFFINITY_MAX; i++) {
+		if (s->read_streams[i].valid) {
+			read_state_destroy(&s->read_streams[i].rs);
+			memset(&s->read_streams[i], 0, sizeof(s->read_streams[i]));
+		}
+	}
+	s->read_stream_clock = 0;
+	s->read_stream_next_worker = 0;
+	s->read_stream_next_id = 1;
+}
+
+static struct read_stream_ctx *session_get_read_stream(struct helper_session *s,
+						       uint64_t stream_id)
+{
+	size_t i;
+
+	if (stream_id == 0)
+		return NULL;
+	for (i = 0; i < HELPER_READ_STREAM_AFFINITY_MAX; i++) {
+		if (!s->read_streams[i].valid)
+			continue;
+		if (s->read_streams[i].stream_id == stream_id)
+			return &s->read_streams[i];
+	}
+	return NULL;
+}
+
+static struct read_stream_ctx *session_assign_read_stream(struct helper_session *s,
+							  const struct mfs_ctrl_read_req *req)
+{
+	struct read_stream_ctx *victim = NULL;
 	uint64_t band;
-	struct read_stream_affinity_entry *victim = NULL;
+	uint64_t now;
 	size_t i;
 
 	if (!req)
-		return 0;
+		return NULL;
 
 	band = mfs_read_band(req->offset);
+	now = monotonic_ms();
 	for (i = 0; i < HELPER_READ_STREAM_AFFINITY_MAX; i++) {
-		struct read_stream_affinity_entry *ent = &s->read_stream_affinity[i];
+		struct read_stream_ctx *ctx = &s->read_streams[i];
 
-		if (!ent->valid)
+		if (!ctx->valid || ctx->inode != req->inode)
 			continue;
-		if (ent->inode != req->inode || ent->band != band)
+		if (req->flags != 0 && ctx->stream_hint != req->flags)
 			continue;
-		ent->stamp = ++s->read_stream_affinity_clock;
-		return ent->worker_id % HELPER_READ_WORKERS;
-	}
-
-	for (i = 0; i < HELPER_READ_STREAM_AFFINITY_MAX; i++) {
-		struct read_stream_affinity_entry *ent = &s->read_stream_affinity[i];
-
-		if (!victim || !victim->valid ||
-		    (ent->valid && ent->stamp < victim->stamp) ||
-		    !ent->valid) {
-			victim = ent;
-			if (!ent->valid)
-				break;
+		if (ctx->next_offset == req->offset || ctx->last_offset == req->offset) {
+			ctx->last_used_ms = now;
+			ctx->band = band;
+			return ctx;
 		}
 	}
 
-	if (!victim)
-		return 0;
+	for (i = 0; i < HELPER_READ_STREAM_AFFINITY_MAX; i++) {
+		struct read_stream_ctx *ctx = &s->read_streams[i];
 
+		if (!ctx->valid) {
+			victim = ctx;
+			break;
+		}
+		if (ctx->in_flight)
+			continue;
+		if (!victim || ctx->last_used_ms < victim->last_used_ms)
+			victim = ctx;
+	}
+
+	if (!victim)
+		return NULL;
+
+	if (victim->valid)
+		read_state_destroy(&victim->rs);
 	memset(victim, 0, sizeof(*victim));
+	read_state_init(&victim->rs);
 	victim->valid = true;
+	victim->stream_id = s->read_stream_next_id++;
+	if (victim->stream_id == 0)
+		victim->stream_id = s->read_stream_next_id++;
 	victim->inode = req->inode;
+	victim->stream_hint = req->flags;
 	victim->band = band;
+	victim->last_offset = req->offset;
+	victim->next_offset = req->offset;
 	victim->worker_id = s->read_stream_next_worker++ % HELPER_READ_WORKERS;
-	victim->stamp = ++s->read_stream_affinity_clock;
-	return victim->worker_id;
+	victim->last_used_ms = now;
+	return victim;
 }
 
 static void session_reset_read_meta_cache(struct helper_session *s)
@@ -5161,6 +5218,7 @@ static int enqueue_read_job(struct helper_session *s,
 	size_t free_slot = HELPER_READ_JOB_QUEUE_MAX;
 	uint8_t *payload_copy = NULL;
 	uint32_t preferred_worker = 0;
+	uint64_t stream_id = 0;
 
 	if (payload_len) {
 		payload_copy = malloc(payload_len);
@@ -5169,9 +5227,16 @@ static int enqueue_read_job(struct helper_session *s,
 		memcpy(payload_copy, payload, payload_len);
 	}
 	pthread_mutex_lock(&s->read_job_mu);
-	if (payload_len >= sizeof(struct mfs_ctrl_read_req))
-		preferred_worker = session_select_read_worker(
-			s, (const struct mfs_ctrl_read_req *)payload_copy);
+	if (payload_len >= sizeof(struct mfs_ctrl_read_req)) {
+		struct read_stream_ctx *ctx =
+			session_assign_read_stream(s,
+				(const struct mfs_ctrl_read_req *)payload_copy);
+		if (ctx) {
+			preferred_worker = ctx->worker_id % HELPER_READ_WORKERS;
+			stream_id = ctx->stream_id;
+			ctx->last_used_ms = monotonic_ms();
+		}
+	}
 	for (;;) {
 		for (i = 0; i < HELPER_READ_JOB_QUEUE_MAX; i++) {
 			if (!s->read_jobs[i].valid) {
@@ -5193,6 +5258,7 @@ static int enqueue_read_job(struct helper_session *s,
 	s->read_jobs[free_slot].payload = payload_copy;
 	s->read_jobs[free_slot].payload_len = payload_len;
 	s->read_jobs[free_slot].preferred_worker = preferred_worker;
+	s->read_jobs[free_slot].stream_id = stream_id;
 	pthread_cond_broadcast(&s->read_job_cv);
 	pthread_mutex_unlock(&s->read_job_mu);
 	return 0;
@@ -5203,14 +5269,11 @@ static void *read_worker_thread_main(void *arg)
 	struct read_worker_arg *wa = arg;
 	struct helper_session *s = wa->session;
 	uint32_t worker_id = wa->worker_id;
-	struct read_state rs;
-	uint32_t last_inode = 0;
-
-	read_state_init(&rs);
 	for (;;) {
 		struct read_job job = {0};
 		uint8_t *rsp_payload = NULL;
 		uint32_t rsp_len = 0;
+		struct read_stream_ctx *ctx = NULL;
 		int status;
 		int ret;
 		size_t i;
@@ -5232,6 +5295,9 @@ static void *read_worker_thread_main(void *arg)
 				}
 				job = s->read_jobs[i];
 				memset(&s->read_jobs[i], 0, sizeof(s->read_jobs[i]));
+				ctx = session_get_read_stream(s, job.stream_id);
+				if (ctx)
+					ctx->in_flight = true;
 				pthread_cond_broadcast(&s->read_job_cv);
 				break;
 			}
@@ -5240,6 +5306,9 @@ static void *read_worker_thread_main(void *arg)
 				if (s->read_jobs[i].valid) {
 					job = s->read_jobs[i];
 					memset(&s->read_jobs[i], 0, sizeof(s->read_jobs[i]));
+					ctx = session_get_read_stream(s, job.stream_id);
+					if (ctx)
+						ctx->in_flight = true;
 					pthread_cond_broadcast(&s->read_job_cv);
 				}
 			}
@@ -5258,18 +5327,38 @@ static void *read_worker_thread_main(void *arg)
 			const struct mfs_ctrl_read_req *req =
 				(const struct mfs_ctrl_read_req *)job.payload;
 
-			if (last_inode != req->inode) {
-				read_state_destroy(&rs);
-				read_state_init(&rs);
-				last_inode = req->inode;
+			if (!ctx) {
+				status = -ESHUTDOWN;
+			} else {
+				status = read_state_read_data(s, &ctx->rs, req,
+						&rsp_payload, &rsp_len);
 			}
-			status = read_state_read_data(s, &rs, req,
-					&rsp_payload, &rsp_len);
 		}
 
 		pthread_mutex_lock(&s->ctrl_write_mu);
 		ret = send_response(s->ctrl_fd, &job.hdr, status, rsp_payload, rsp_len);
 		pthread_mutex_unlock(&s->ctrl_write_mu);
+		pthread_mutex_lock(&s->read_job_mu);
+		if (ctx) {
+			const struct mfs_ctrl_read_req *req =
+				(job.payload_len >= sizeof(struct mfs_ctrl_read_req)) ?
+				(const struct mfs_ctrl_read_req *)job.payload : NULL;
+			ctx->in_flight = false;
+			ctx->last_used_ms = monotonic_ms();
+			if (req && status >= 0) {
+				uint64_t consumed = rsp_len;
+
+				if (consumed >= sizeof(struct mfs_ctrl_read_rsp))
+					consumed -= sizeof(struct mfs_ctrl_read_rsp);
+				else
+					consumed = 0;
+				ctx->last_offset = req->offset;
+				ctx->next_offset = req->offset + consumed;
+				ctx->band = mfs_read_band(ctx->next_offset);
+			}
+		}
+		pthread_cond_broadcast(&s->read_job_cv);
+		pthread_mutex_unlock(&s->read_job_mu);
 		free(rsp_payload);
 		free(job.payload);
 		if (ret) {
@@ -5279,7 +5368,6 @@ static void *read_worker_thread_main(void *arg)
 		}
 	}
 
-	read_state_destroy(&rs);
 	return NULL;
 }
 
@@ -5290,9 +5378,7 @@ static int session_start_read_workers(struct helper_session *s)
 	pthread_mutex_lock(&s->read_job_mu);
 	s->read_worker_stop = false;
 	memset(s->read_jobs, 0, sizeof(s->read_jobs));
-	memset(s->read_stream_affinity, 0, sizeof(s->read_stream_affinity));
-	s->read_stream_affinity_clock = 0;
-	s->read_stream_next_worker = 0;
+	session_reset_read_streams(s);
 	pthread_mutex_unlock(&s->read_job_mu);
 
 	for (i = 0; i < HELPER_READ_WORKERS; i++) {
@@ -5328,6 +5414,9 @@ static void session_stop_read_workers(struct helper_session *s)
 
 	for (i = 0; i < HELPER_READ_WORKERS; i++)
 		pthread_join(s->read_workers[i], NULL);
+	pthread_mutex_lock(&s->read_job_mu);
+	session_reset_read_streams(s);
+	pthread_mutex_unlock(&s->read_job_mu);
 	s->read_worker_running = false;
 }
 
