@@ -44,6 +44,7 @@ mfsmaster_SOURCES = \
 	sharedpointer.c sharedpointer.h \
 	matocsserv.c matocsserv.h \
 	matoclserv.c matoclserv.h \
+	matoclquic.c matoclquic.h \
 	matomlserv.c matomlserv.h \
 	datacachemgr.c datacachemgr.h \
 	chartsdata.c chartsdata.h \
@@ -88,8 +89,8 @@ mfsmaster_SOURCES = \
 
 
 mfsmaster_CFLAGS = $(DYNLINKER_FLAGS)
-mfsmaster_CPPFLAGS = $(AM_CPPFLAGS) -DMFSMAXFILES=16384 -DAPPNAME=mfsmaster
-mfsmaster_LDFLAGS = $(ZLIB_LIBS)
+mfsmaster_CPPFLAGS = $(AM_CPPFLAGS) $(NGTCP2_CFLAGS) -DMFSMAXFILES=16384 -DAPPNAME=mfsmaster
+mfsmaster_LDFLAGS = $(ZLIB_LIBS) $(NGTCP2_LIBS)
 
 mfssupervisor_SOURCES = \
 	mfssupervisor.c \

@@ -243,6 +243,9 @@
 /* Define to 1 if you have the <netinet/in.h> header file. */
 #undef HAVE_NETINET_IN_H
 
+/* libngtcp2 with OpenSSL backend detected */
+#undef HAVE_NGTCP2
+
 /* libpcap has function pcap_findalldevs */
 #undef HAVE_PCAP_FINDALLDEVS
 

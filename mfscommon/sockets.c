@@ -1069,9 +1069,6 @@ int udpstrlisten(int sock,const char *hostname,const char *service) {
 
 int udpwrite(int sock,uint32_t ip,uint16_t port,const void *buff,uint16_t leng) {
 	struct sockaddr_in sa;
-	if (leng>512) {
-		return -1;
-	}
 	sockaddrnumfill(&sa,ip,port);
 	return sendto(sock,buff,leng,0,(struct sockaddr *)&sa,sizeof(struct sockaddr_in));
 }
@@ -1081,6 +1078,7 @@ int udpread(int sock,uint32_t *ip,uint16_t *port,void *buff,uint16_t leng) {
 	struct sockaddr tempaddr;
 	struct sockaddr_in *saptr;
 	int ret;
+	templeng = sizeof(tempaddr);
 	ret = recvfrom(sock,buff,leng,0,&tempaddr,&templeng);
 	if (templeng==sizeof(struct sockaddr_in)) {
 		saptr = ((struct sockaddr_in*)&tempaddr);

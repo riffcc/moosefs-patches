@@ -65,6 +65,9 @@
 #define CONNECT_RETRIES 10
 #define CONNECT_TIMEOUT(cnt) (((cnt)%2)?(300*(1<<((cnt)>>1))):(200*(1<<((cnt)>>1))))
 
+#define MFS_WRITE_PROTO_BASE_MASK 0x7F
+#define MFS_WRITE_PROTOFLAG_OUTOFORDER_ACKS 0x80
+
 static uint32_t MaxPacketSize = CSTOCS_MAXPACKETSIZE;
 
 #ifdef HAVE_MMAP
@@ -100,6 +103,7 @@ static uint64_t stats_bytesin=0;
 static uint64_t stats_bytesout=0;
 static uint32_t stats_hlopr=0;
 static uint32_t stats_hlopw=0;
+static uint8_t EnableOoOWriteAcks = 0;
 
 void mainserv_stats(uint64_t *bin,uint64_t *bout,uint32_t *hlopr,uint32_t *hlopw) {
 #ifdef HAVE___SYNC_FETCH_AND_OP
@@ -529,11 +533,44 @@ typedef struct write_xchg {
 	uint32_t version;
 	int pipe[2];
 	write_job *head,*hddhead,*nethead,**tail;
+	uint8_t unordered_acks;
 	pthread_mutex_t lock;
 	pthread_cond_t cond;
 	uint8_t condwaiting;
 	uint8_t term;
 } write_xchg;
+
+static inline uint8_t mainserv_write_job_ready(write_job *wrjob) {
+	if (wrjob->ack&1 && wrjob->hddstatus!=MFS_STATUS_OK) {
+		return 1;
+	}
+	if (wrjob->ack&2 && wrjob->netstatus!=MFS_STATUS_OK) {
+		return 1;
+	}
+	return (wrjob->ack==3)?1:0;
+}
+
+static write_job** mainserv_write_find_by_writeid(write_job **head,uint64_t chunkid,uint32_t writeid) {
+	write_job **jobpp;
+
+	for (jobpp=head ; *jobpp ; jobpp=&((*jobpp)->next)) {
+		if ((*jobpp)->chunkid==chunkid && (*jobpp)->writeid==writeid) {
+			return jobpp;
+		}
+	}
+	return NULL;
+}
+
+static write_job** mainserv_write_find_ready(write_job **head) {
+	write_job **jobpp;
+
+	for (jobpp=head ; *jobpp ; jobpp=&((*jobpp)->next)) {
+		if (mainserv_write_job_ready(*jobpp)) {
+			return jobpp;
+		}
+	}
+	return NULL;
+}
 
 void* mainserv_write_thread(void* arg) {
 	write_xchg *wrdata = (write_xchg*)arg;
@@ -571,10 +608,11 @@ void* mainserv_write_thread(void* arg) {
 	return NULL;
 }
 
-uint8_t mainserv_write_middle(int sock,int fwdsock,uint64_t gchunkid,uint32_t gversion,uint8_t protover,sock_nops *sn,sock_nops *fsn) {
+uint8_t mainserv_write_middle(int sock,int fwdsock,uint64_t gchunkid,uint32_t gversion,uint8_t protover,uint8_t writeflags,sock_nops *sn,sock_nops *fsn) {
 	pthread_t wrthread;
 	write_xchg wrdata;
 	write_job *wrjob;
+	write_job **wrjobpp;
 	uint8_t *packet,*wptr;
 	const uint8_t *rptr;
 	struct pollfd pfd[3];
@@ -586,6 +624,7 @@ uint8_t mainserv_write_middle(int sock,int fwdsock,uint64_t gchunkid,uint32_t gv
 	uint32_t writeid;
 	uint8_t status;
 	uint8_t gotlast;
+	uint8_t finish_received;
 
 	wrdata.chunkid = gchunkid;
 	wrdata.version = gversion;
@@ -602,6 +641,7 @@ uint8_t mainserv_write_middle(int sock,int fwdsock,uint64_t gchunkid,uint32_t gv
 	wrdata.tail = &(wrdata.head);
 	wrdata.hddhead = NULL;
 	wrdata.nethead = NULL;
+	wrdata.unordered_acks = (writeflags&MFS_WRITE_PROTOFLAG_OUTOFORDER_ACKS)?1:0;
 	zassert(pthread_mutex_init(&(wrdata.lock),NULL));
 	zassert(pthread_cond_init(&(wrdata.cond),NULL));
 	wrdata.condwaiting = 0;
@@ -612,6 +652,7 @@ uint8_t mainserv_write_middle(int sock,int fwdsock,uint64_t gchunkid,uint32_t gv
 	pdataleng = 4096;
 	myalloc(pdata,pdataleng);
 	gotlast = 0;
+	finish_received = 0;
 
 	while (1) {
 		if (poll(pfd,3,SERV_TIMEOUT)<0) {
@@ -713,8 +754,13 @@ uint8_t mainserv_write_middle(int sock,int fwdsock,uint64_t gchunkid,uint32_t gv
 					mainserv_send_and_free("write status",sock,packet,8+4+1);
 					break;
 				}
-				gotlast = (wrdata.head==NULL)?2:1;
-				break;
+				if (wrdata.unordered_acks) {
+					finish_received = 1;
+					pfd[0].events = 0;
+				} else {
+					gotlast = (wrdata.head==NULL)?2:1;
+					break;
+				}
 			} else if (cmd==CLTOCS_WRITE_DATA) {
 //				uint32_t crc;
 //				const uint8_t *crcptr;
@@ -848,22 +894,33 @@ uint8_t mainserv_write_middle(int sock,int fwdsock,uint64_t gchunkid,uint32_t gv
 						wrdata.tail = &(wrjob->next);
 					}
 				} else {
-					wrjob = wrdata.nethead;
-					if (wrjob==NULL) {
-						zassert(pthread_mutex_unlock(&(wrdata.lock)));
-						break;
+					if (wrdata.unordered_acks) {
+						wrjobpp = mainserv_write_find_by_writeid(&(wrdata.head),chunkid,writeid);
+						if (wrjobpp==NULL) {
+							zassert(pthread_mutex_unlock(&(wrdata.lock)));
+							break;
+						}
+						wrjob = *wrjobpp;
+						wrjob->netstatus = status;
+						wrjob->ack |= 2;
+					} else {
+						wrjob = wrdata.nethead;
+						if (wrjob==NULL) {
+							zassert(pthread_mutex_unlock(&(wrdata.lock)));
+							break;
+						}
+						if (chunkid!=wrjob->chunkid) {	// wrong chunkid
+							zassert(pthread_mutex_unlock(&(wrdata.lock)));
+							break;
+						}
+						if (writeid!=wrjob->writeid) {	// wrong writeid
+							zassert(pthread_mutex_unlock(&(wrdata.lock)));
+							break;
+						}
+						wrjob->netstatus = status;
+						wrjob->ack|=2;
+						wrdata.nethead = wrjob->next;
 					}
-					if (chunkid!=wrjob->chunkid) {	// wrong chunkid
-						zassert(pthread_mutex_unlock(&(wrdata.lock)));
-						break;
-					}
-					if (writeid!=wrjob->writeid) {	// wrong writeid
-						zassert(pthread_mutex_unlock(&(wrdata.lock)));
-						break;
-					}
-					wrjob->netstatus = status;
-					wrjob->ack|=2;
-					wrdata.nethead = wrjob->next;
 				}
 				zassert(pthread_mutex_unlock(&(wrdata.lock)));
 			}
@@ -882,14 +939,29 @@ uint8_t mainserv_write_middle(int sock,int fwdsock,uint64_t gchunkid,uint32_t gv
 				break;
 			}
 			exitloop = 1;
-			wrjob = wrdata.head;
-			if (wrjob->ack&1 && wrjob->hddstatus!=MFS_STATUS_OK) {
-				status = wrjob->hddstatus;
-			} else if (wrjob->ack&2 && wrjob->netstatus!=MFS_STATUS_OK) {
-				status = wrjob->netstatus;
-			} else if (wrjob->ack==3) {
-				status = MFS_STATUS_OK;
-				exitloop = 0;
+			if (wrdata.unordered_acks) {
+				wrjobpp = mainserv_write_find_ready(&(wrdata.head));
+				if (wrjobpp) {
+					wrjob = *wrjobpp;
+					if (wrjob->ack&1 && wrjob->hddstatus!=MFS_STATUS_OK) {
+						status = wrjob->hddstatus;
+					} else if (wrjob->ack&2 && wrjob->netstatus!=MFS_STATUS_OK) {
+						status = wrjob->netstatus;
+					} else {
+						status = MFS_STATUS_OK;
+						exitloop = 0;
+					}
+				}
+			} else {
+				wrjob = wrdata.head;
+				if (wrjob->ack&1 && wrjob->hddstatus!=MFS_STATUS_OK) {
+					status = wrjob->hddstatus;
+				} else if (wrjob->ack&2 && wrjob->netstatus!=MFS_STATUS_OK) {
+					status = wrjob->netstatus;
+				} else if (wrjob->ack==3) {
+					status = MFS_STATUS_OK;
+					exitloop = 0;
+				}
 			}
 			if (exitloop) {
 				zassert(pthread_mutex_unlock(&(wrdata.lock)));
@@ -897,9 +969,22 @@ uint8_t mainserv_write_middle(int sock,int fwdsock,uint64_t gchunkid,uint32_t gv
 			}
 			chunkid = wrjob->chunkid;
 			writeid = wrjob->writeid;
-			wrdata.head = wrjob->next;
-			if (wrdata.head==NULL) {
-				wrdata.tail = &(wrdata.head);
+			if (wrdata.unordered_acks) {
+				*wrjobpp = wrjob->next;
+				if (wrdata.hddhead==wrjob) {
+					wrdata.hddhead = wrjob->next;
+				}
+				if (wrdata.nethead==wrjob) {
+					wrdata.nethead = wrjob->next;
+				}
+				if (wrjob->next==NULL) {
+					wrdata.tail = wrjobpp;
+				}
+			} else {
+				wrdata.head = wrjob->next;
+				if (wrdata.head==NULL) {
+					wrdata.tail = &(wrdata.head);
+				}
 			}
 			myunalloc(wrjob,wrjob->structsize);
 			zassert(pthread_mutex_unlock(&(wrdata.lock)));
@@ -921,6 +1006,10 @@ uint8_t mainserv_write_middle(int sock,int fwdsock,uint64_t gchunkid,uint32_t gv
 			status = MFS_ERROR_DISCONNECTED; // any error
 		}
 		if (status!=MFS_STATUS_OK) {
+			break;
+		}
+		if (finish_received && wrdata.head==NULL) {
+			gotlast = 2;
 			break;
 		}
 		if (pfd[1].revents & POLLHUP) {
@@ -963,7 +1052,7 @@ uint8_t mainserv_write_middle(int sock,int fwdsock,uint64_t gchunkid,uint32_t gv
 	return gotlast;
 }
 
-uint8_t mainserv_write_last(int sock,uint64_t gchunkid,uint32_t gversion,uint8_t protover,sock_nops *sn) {
+uint8_t mainserv_write_last(int sock,uint64_t gchunkid,uint32_t gversion,uint8_t protover,uint8_t writeflags,sock_nops *sn) {
 	uint8_t *packet,*wptr;
 	const uint8_t *rptr;
 	uint8_t *pdata;
@@ -978,8 +1067,9 @@ uint8_t mainserv_write_last(int sock,uint64_t gchunkid,uint32_t gversion,uint8_t
 	uint8_t rstat;
 	uint8_t status;
 
-	status = 0; // make gcc happy
+	status = 0;
 	writeid = 0;
+	(void)writeflags;
 	packet = mainserv_create_packet(&wptr,CSTOCL_WRITE_STATUS,8+4+1);
 	put64bit(&wptr,gchunkid);
 	put32bit(&wptr,0);
@@ -1033,8 +1123,6 @@ uint8_t mainserv_write_last(int sock,uint64_t gchunkid,uint32_t gversion,uint8_t
 			break;
 		}
 		if (cmd==CLTOCS_WRITE_DATA) {
-//			uint32_t crc;
-//			const uint8_t *crcptr;
 			if (leng<8+4+2+2+4+4) {
 				mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CLTOCS_WRITE_DATA - wrong size (%"PRIu32"/24+size)",leng);
 				break;
@@ -1045,8 +1133,6 @@ uint8_t mainserv_write_last(int sock,uint64_t gchunkid,uint32_t gversion,uint8_t
 			blocknum = get16bit(&rptr);
 			offset = get16bit(&rptr);
 			size = get32bit(&rptr);
-//				crcptr = rptr;
-//				crc = get32bit(&crcptr);
 			if (leng!=8+4+2+2+4+4+size) {
 				mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CLTOCS_WRITE_DATA - wrong size (%"PRIu32"/24+%"PRIu32")",leng,size);
 				break;
@@ -1056,31 +1142,8 @@ uint8_t mainserv_write_last(int sock,uint64_t gchunkid,uint32_t gversion,uint8_t
 				status = MFS_ERROR_WRONGCHUNKID;
 				break;
 			}
-/*
-			mfs_log(MFSLOG_SYSLOG,MFSLOG_DEBUG,"chunkid: %016X, version: %08X, blocknum: %"PRIu16", offset: %"PRIu16", size: %"PRIu32", crc: %08"PRIX32":%08"PRIX32,chunkid,version,blocknum,offset,size,crc,mycrc32(0,rptr+4,size));
-			if (crc!=mycrc32(0,rptr+4,size)) {
-				uint32_t xxx,sl;
-				char buff[200];
-				for (xxx=0 ; xxx<size ; xxx++) {
-					if ((xxx&0x3F)==0) {
-						sl = snprintf(buff,200,"%05X: ",xxx);
-					}
-					sl += snprintf(buff+sl,200-sl,"%02X",rptr[xxx+4]);
-					if ((xxx&0x3F)==0x1F) {
-						buff[sl]=0;
-						mfs_log(MFSLOG_SYSLOG,MFSLOG_DEBUG,"hexdump: %s",buff);
-						sl=0;
-					}
-				}
-				if (sl>0) {
-					buff[sl]=0;
-					mfs_log(MFSLOG_SYSLOG,MFSLOG_DEBUG,"hexdump: %s",buff);
-				}
-			}
-*/
 			status = hdd_write(gchunkid,gversion,blocknum,rptr+4,offset,size,rptr);
 			if (status!=MFS_STATUS_OK) {
-//				mfs_log(MFSLOG_SYSLOG,MFSLOG_DEBUG,"hdd_write error: %s",mfsstrerr(status));
 				rstat = 1;
 				break;
 			}
@@ -1127,7 +1190,9 @@ uint8_t mainserv_write(int sock,const uint8_t *data,uint32_t length) {
 	int fwdsock;
 	uint32_t fwdip;
 	uint16_t fwdport;
+	uint8_t rawprotover;
 	uint8_t protover;
+	uint8_t writeflags;
 	uint64_t gchunkid;
 	uint32_t gversion;
 	uint32_t i;
@@ -1141,13 +1206,19 @@ uint8_t mainserv_write(int sock,const uint8_t *data,uint32_t length) {
 			mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CLTOCS_WRITE - wrong size (%"PRIu32"/13+N*6)",length);
 			return 0;
 		}
-		protover = get8bit(&data);
+		rawprotover = get8bit(&data);
+		writeflags = rawprotover & (~MFS_WRITE_PROTO_BASE_MASK);
+		protover = rawprotover & MFS_WRITE_PROTO_BASE_MASK;
+		if ((writeflags&MFS_WRITE_PROTOFLAG_OUTOFORDER_ACKS) && EnableOoOWriteAcks==0) {
+			writeflags &= ~MFS_WRITE_PROTOFLAG_OUTOFORDER_ACKS;
+		}
 	} else {
 		if (length<12 || ((length-12)%6)!=0) {
 			mfs_log(MFSLOG_SYSLOG,MFSLOG_WARNING,"CLTOCS_WRITE - wrong size (%"PRIu32"/12+N*6)",length);
 			return 0;
 		}
 		protover = 0;
+		writeflags = 0;
 	}
 	if (protover) {
 		mainserv_sock_nop_init(&sn,sock);
@@ -1175,7 +1246,7 @@ uint8_t mainserv_write(int sock,const uint8_t *data,uint32_t length) {
 			if (fwdsock>=0) {
 				packet = mainserv_create_packet(&wptr,CLTOCS_WRITE,length-6);
 				if (protover) {
-					put8bit(&wptr,protover);
+					put8bit(&wptr,protover|writeflags);
 				}
 				put64bit(&wptr,gchunkid);
 				put32bit(&wptr,gversion);
@@ -1228,7 +1299,7 @@ uint8_t mainserv_write(int sock,const uint8_t *data,uint32_t length) {
 		return mainserv_send_and_free("write status",sock,packet,8+4+1);
 	}
 	if (fwdsock>=0) {
-		ret = mainserv_write_middle(sock,fwdsock,gchunkid,gversion,protover,&sn,&fsn);
+		ret = mainserv_write_middle(sock,fwdsock,gchunkid,gversion,protover,writeflags,&sn,&fsn);
 		if (protover) {
 			mainserv_sock_nop_del(&fsn);
 		}
@@ -1242,7 +1313,7 @@ uint8_t mainserv_write(int sock,const uint8_t *data,uint32_t length) {
 		tcpclose(fwdsock);
 #endif
 	} else {
-		ret = mainserv_write_last(sock,gchunkid,gversion,protover,&sn);
+		ret = mainserv_write_last(sock,gchunkid,gversion,protover,writeflags,&sn);
 	}
 	hdd_close(gchunkid,0); // TODO: add flag to control fsync here
 	if (protover) {
@@ -1272,6 +1343,10 @@ int mainserv_init(void) {
 		mfs_log(MFSLOG_SYSLOG_STDERR,MFSLOG_NOTICE,"mmap is not supported in your OS - ignoring CAN_USE_MMAP option");
 	}
 #endif
+	EnableOoOWriteAcks = cfg_getuint8("ENABLE_OOO_WRITE_ACKS",0);
+	if (EnableOoOWriteAcks) {
+		mfs_log(MFSLOG_SYSLOG_STDERR,MFSLOG_NOTICE,"experimental out-of-order write ack mode enabled");
+	}
 	if (conncache_init(250)<0) {
 		return -1;
 	}

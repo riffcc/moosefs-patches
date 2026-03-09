@@ -1172,6 +1172,10 @@
 #define CLTOCS_WRITE (PROTO_BASE+210)
 // chunkid:64 version:32 N*[ ip:32 port:16 ]
 // protocolid:8 chunkid:64 version:32 N*[ ip:32 port:16 ] (both versions >= 1.7.32)
+// experimental extended patch:
+//   protocolid low 7 bits = base protocol version
+//   protocolid bit 7 set   = sender accepts out-of-order CSTOCL_WRITE_STATUS replies
+//                            for CLTOCS_WRITE_DATA fragments on this socket
 
 // 0x00D3
 #define CSTOCL_WRITE_STATUS (PROTO_BASE+211)
@@ -2305,12 +2309,20 @@
 // N*[ inode:32 pathssize:32 M*[ pathleng:32 path:pathlengB ] ]
 
 // 0x021A
+#define CLTOMA_QUIC_HELLO (PROTO_BASE+538)
+// magic:32 version:32 flags:32 alpnlen:8 alpn:alpnlenB
 
 // 0x021B
+#define MATOCL_QUIC_HELLO (PROTO_BASE+539)
+// status:8 version:32 flags:32 tcp_port:16 udp_port:16 max_datagram:16 alpnlen:8 alpn:alpnlenB
 
 // 0x021C
+#define CLTOMA_QUIC_PACKET (PROTO_BASE+540)
+// reqid:32 inner_packet:(type:32 length:32 data:lengthB)
 
 // 0x021D
+#define MATOCL_QUIC_PACKET (PROTO_BASE+541)
+// reqid:32 status:8 [ inner_packet:(type:32 length:32 data:lengthB) ]
 
 // 0x021E
 #define CLTOMA_SCLASS_INFO (PROTO_BASE+542)

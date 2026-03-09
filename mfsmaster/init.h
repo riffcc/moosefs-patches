@@ -29,6 +29,7 @@
 #include "matomlserv.h"
 #include "matocsserv.h"
 #include "matoclserv.h"
+#include "matoclquic.h"
 #include "metadata.h"
 #include "random.h"
 #include "changelog.h"
@@ -72,6 +73,7 @@ struct {
 	{matomlserv_init,"communication with metalogger"},
 	{matocsserv_init,"communication with chunkserver"},
 	{matoclserv_init,"communication with clients"},
+	{matoclquic_init,"experimental communication with clients over QUIC"},
 	{(runfn)0,"****"}
 },LateRunTab[]={
 	{(runfn)0,"****"}

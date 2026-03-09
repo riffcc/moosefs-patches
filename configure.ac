@@ -477,6 +477,22 @@ else
 fi
 AC_SUBST([systemdunitdir])
 
+if test -n "$PKG_CONFIG"; then
+	PKG_CHECK_MODULES([NGTCP2], [libngtcp2 libngtcp2_crypto_ossl], [
+		NGTCP2_CFLAGS="$NGTCP2_CFLAGS -DHAVE_NGTCP2"
+		NGTCP2_LIBS="$NGTCP2_LIBS -lssl -lcrypto"
+		AC_DEFINE([HAVE_NGTCP2],[1],[libngtcp2 with OpenSSL backend detected])
+	], [
+		NGTCP2_CFLAGS=
+		NGTCP2_LIBS=
+	])
+else
+	NGTCP2_CFLAGS=
+	NGTCP2_LIBS=
+fi
+AC_SUBST([NGTCP2_CFLAGS])
+AC_SUBST([NGTCP2_LIBS])
+
 dnl this is work in progress
 dnl AC_ARG_ENABLE([lightmfs], [AS_HELP_STRING([--enable-lightmfs], [Build special version])])
 

@@ -64,6 +64,7 @@
 #include "changelog.h"
 #include "clocks.h"
 #include "matoclserv.h"
+#include "matoclquic.h"
 #include "matocsserv.h"
 #include "matomlserv.h"
 #include "crc.h"
@@ -891,6 +892,7 @@ int meta_storeall(int bg,uint8_t dontstore) {
 		} else if (i==0) { // child
 			matocsserv_close_lsock();
 			matoclserv_close_lsock();
+			matoclquic_close_lsock();
 			matomlserv_close_lsock();
 			processname_set("mfsmaster (metadata saver)");
 		}
