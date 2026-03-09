@@ -1,0 +1,13 @@
+[package]
+name = "moosefs-direct"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust MooseFS userspace client crate"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+memmap2 = "0.9"
+md5 = "0.7"
