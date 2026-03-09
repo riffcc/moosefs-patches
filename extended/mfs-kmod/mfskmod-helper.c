@@ -3399,6 +3399,14 @@ static void read_state_invalidate(struct read_state *rs)
 	read_state_reset_stripe(rs);
 }
 
+static void read_state_recover_after_error(struct read_state *rs)
+{
+	read_state_drop_cs(rs);
+	read_state_reset_scoreboard(rs);
+	if (rs->prefetch_len > HELPER_READ_PREFETCH_BASE)
+		rs->prefetch_len = HELPER_READ_PREFETCH_BASE;
+}
+
 static void read_state_prepare_stripe(struct read_state *rs,
 				      uint32_t inode, uint32_t chunk_idx)
 {
@@ -4642,7 +4650,7 @@ static int read_state_read_data(struct helper_session *s,
 	return 0;
 
 out:
-	read_state_invalidate(rs);
+	read_state_recover_after_error(rs);
 	free(payload);
 	return ret;
 }
