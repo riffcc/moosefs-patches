@@ -2,7 +2,7 @@
 
 #include "block/block_int-common.h"
 #include "qapi/error.h"
-#include "qapi/qmp/qdict.h"
+#include "qobject/qdict.h"
 #include "qemu/coroutine.h"
 #include "qemu/error-report.h"
 #include "qemu/iov.h"
@@ -45,6 +45,7 @@ typedef struct MFSWriteBuffer {
 
 typedef struct BDRVMFSState {
     char *master_endpoint;
+    char *session_subdir;
     char *path;
     uint64_t inode;
     int64_t size;
@@ -62,6 +63,34 @@ typedef struct BDRVMFSState {
 
     CoMutex io_lock;
 } BDRVMFSState;
+
+static int mfs_prepare_session_path(const char *path, char **subdir_out,
+                                    char **relpath_out, Error **errp)
+{
+    const char *slash;
+
+    if (!path || path[0] != '/') {
+        error_setg(errp, "mfs: path must be absolute");
+        return -EINVAL;
+    }
+
+    slash = strchr(path + 1, '/');
+    if (!slash) {
+        *subdir_out = g_strdup("/");
+        *relpath_out = g_strdup(path);
+        return 0;
+    }
+
+    if (slash == path + 1) {
+        *subdir_out = g_strdup("/");
+        *relpath_out = g_strdup(slash);
+        return 0;
+    }
+
+    *subdir_out = g_strndup(path, slash - path);
+    *relpath_out = g_strdup(slash);
+    return 0;
+}
 
 static uint64_t mfs_min_u64(uint64_t a, uint64_t b)
 {
@@ -208,7 +237,7 @@ static int mfs_master_register(BDRVMFSState *s, Error **errp)
         return fd;
     }
 
-    ret = mfs_proto_register_session(fd, "qemu-mfs",
+    ret = mfs_proto_register_session(fd, "qemu-mfs", s->session_subdir,
                                      s->has_password ? s->password_md5 : NULL,
                                      &s->master_version, errp);
     if (ret < 0) {
@@ -320,32 +349,49 @@ static int mfs_chunkserver_read(BDRVMFSState *s, MFSChunkCacheEntry *entry,
 
     for (i = 0; i < entry->loc.replicas->len; i++) {
         MFSChunkReplica *rep = g_ptr_array_index(entry->loc.replicas, i);
-        MFSConn *conn = mfs_conn_pool_get_chunk(&s->conns, rep->host, rep->port,
-                                                errp);
-        int fd;
-        int ret;
+        int attempt;
 
-        if (!conn) {
-            return -EIO;
-        }
+        for (attempt = 0; attempt < 2; attempt++) {
+            MFSConn *conn = mfs_conn_pool_get_chunk(&s->conns, rep->host,
+                                                    rep->port, errp);
+            Error *attempt_err = NULL;
+            int fd;
+            int ret;
 
-        mfs_conn_lock(conn);
-        fd = mfs_conn_get_fd_locked(conn, &last_err);
-        if (fd < 0) {
-            mfs_conn_unlock(conn);
-            continue;
-        }
+            if (!conn) {
+                return -EIO;
+            }
 
-        ret = mfs_proto_cs_read(fd, &entry->loc, chunk_offset, length,
-                                out, &last_err);
-        if (ret < 0) {
+            mfs_conn_lock(conn);
+            fd = mfs_conn_get_fd_locked(conn, &attempt_err);
+            if (fd < 0) {
+                if (last_err) {
+                    error_free(last_err);
+                }
+                last_err = attempt_err;
+                mfs_conn_unlock(conn);
+                continue;
+            }
+
+            ret = mfs_proto_cs_read(fd, &entry->loc, chunk_offset, length,
+                                    out, &attempt_err);
+            if (ret < 0) {
+                error_prepend(&attempt_err,
+                              "mfs: replica %s:%u read attempt %d: ",
+                              rep->host, rep->port, attempt + 1);
+                if (last_err) {
+                    error_free(last_err);
+                }
+                last_err = attempt_err;
+                mfs_conn_mark_dead_locked(conn);
+                mfs_conn_unlock(conn);
+                continue;
+            }
+
             mfs_conn_mark_dead_locked(conn);
             mfs_conn_unlock(conn);
-            continue;
+            return 0;
         }
-
-        mfs_conn_unlock(conn);
-        return 0;
     }
 
     if (last_err) {
@@ -366,32 +412,49 @@ static int mfs_chunkserver_write(BDRVMFSState *s, MFSChunkCacheEntry *entry,
 
     for (i = 0; i < entry->loc.replicas->len; i++) {
         MFSChunkReplica *rep = g_ptr_array_index(entry->loc.replicas, i);
-        MFSConn *conn = mfs_conn_pool_get_chunk(&s->conns, rep->host, rep->port,
-                                                errp);
-        int fd;
-        int ret;
+        int attempt;
 
-        if (!conn) {
-            return -EIO;
-        }
+        for (attempt = 0; attempt < 2; attempt++) {
+            MFSConn *conn = mfs_conn_pool_get_chunk(&s->conns, rep->host,
+                                                    rep->port, errp);
+            Error *attempt_err = NULL;
+            int fd;
+            int ret;
 
-        mfs_conn_lock(conn);
-        fd = mfs_conn_get_fd_locked(conn, &last_err);
-        if (fd < 0) {
-            mfs_conn_unlock(conn);
-            continue;
-        }
+            if (!conn) {
+                return -EIO;
+            }
 
-        ret = mfs_proto_cs_write(fd, &entry->loc, chunk_offset,
-                                 buf, length, &last_err);
-        if (ret < 0) {
+            mfs_conn_lock(conn);
+            fd = mfs_conn_get_fd_locked(conn, &attempt_err);
+            if (fd < 0) {
+                if (last_err) {
+                    error_free(last_err);
+                }
+                last_err = attempt_err;
+                mfs_conn_unlock(conn);
+                continue;
+            }
+
+            ret = mfs_proto_cs_write(fd, &entry->loc, chunk_offset,
+                                     buf, length, &attempt_err);
+            if (ret < 0) {
+                error_prepend(&attempt_err,
+                              "mfs: replica %s:%u write attempt %d: ",
+                              rep->host, rep->port, attempt + 1);
+                if (last_err) {
+                    error_free(last_err);
+                }
+                last_err = attempt_err;
+                mfs_conn_mark_dead_locked(conn);
+                mfs_conn_unlock(conn);
+                continue;
+            }
+
             mfs_conn_mark_dead_locked(conn);
             mfs_conn_unlock(conn);
-            continue;
+            return 0;
         }
-
-        mfs_conn_unlock(conn);
-        return 0;
     }
 
     if (last_err) {
@@ -421,6 +484,12 @@ static int mfs_backend_read_locked(BDRVMFSState *s, int64_t offset,
         ret = mfs_master_get_chunk(s, chunk_index, false, &entry, NULL, errp);
         if (ret < 0) {
             return ret;
+        }
+
+        if (entry->loc.replicas->len == 0 && entry->loc.chunk_id == 0) {
+            memset(buf + pos, 0, this_len);
+            pos += this_len;
+            continue;
         }
 
         ret = mfs_chunkserver_read(s, entry, chunk_off, this_len,
@@ -458,6 +527,9 @@ static int mfs_backend_write_locked(BDRVMFSState *s, int64_t offset,
 
         ret = mfs_chunkserver_write(s, entry, chunk_off, buf + pos,
                                     this_len, errp);
+        if (ret < 0) {
+            return ret;
+        }
 
         {
             MFSConn *master = mfs_conn_pool_master(&s->conns);
@@ -482,10 +554,6 @@ static int mfs_backend_write_locked(BDRVMFSState *s, int64_t offset,
                 return end_ret;
             }
             mfs_conn_unlock(master);
-        }
-
-        if (ret < 0) {
-            return ret;
         }
 
         pos += this_len;
@@ -577,7 +645,12 @@ static int bdrv_mfs_open(BlockDriverState *bs, QDict *options, int flags,
     }
 
     s->master_endpoint = g_strdup(master);
-    s->path = g_strdup(path);
+    ret = mfs_prepare_session_path(path, &s->session_subdir, &s->path, errp);
+    if (ret < 0) {
+        g_free(s->master_endpoint);
+        s->master_endpoint = NULL;
+        return ret;
+    }
     s->size = 0;
     s->has_password = false;
     memset(s->password_md5, 0, sizeof(s->password_md5));
@@ -656,27 +729,27 @@ static int bdrv_mfs_open(BlockDriverState *bs, QDict *options, int flags,
     }
 
     {
-        MFSConn *master = mfs_conn_pool_master(&s->conns);
+        MFSConn *master_conn = mfs_conn_pool_master(&s->conns);
         int fd;
         uint8_t open_flags = (flags & BDRV_O_RDWR) ? MFS_OPEN_RDWR
                                                    : MFS_OPEN_READONLY;
 
-        mfs_conn_lock(master);
-        fd = mfs_conn_get_fd_locked(master, errp);
+        mfs_conn_lock(master_conn);
+        fd = mfs_conn_get_fd_locked(master_conn, errp);
         if (fd < 0) {
-            mfs_conn_unlock(master);
+            mfs_conn_unlock(master_conn);
             ret = fd;
             goto fail;
         }
 
         ret = mfs_proto_master_open(fd, s->inode, open_flags, errp);
         if (ret < 0) {
-            mfs_conn_mark_dead_locked(master);
-            mfs_conn_unlock(master);
+            mfs_conn_mark_dead_locked(master_conn);
+            mfs_conn_unlock(master_conn);
             goto fail;
         }
 
-        mfs_conn_unlock(master);
+        mfs_conn_unlock(master_conn);
     }
 
     return 0;
@@ -697,6 +770,8 @@ fail:
     mfs_conn_pool_cleanup(&s->conns);
     g_free(s->master_endpoint);
     s->master_endpoint = NULL;
+    g_free(s->session_subdir);
+    s->session_subdir = NULL;
     g_free(s->path);
     s->path = NULL;
     s->has_password = false;
@@ -738,6 +813,9 @@ static void bdrv_mfs_close(BlockDriverState *bs)
 
     g_free(s->master_endpoint);
     s->master_endpoint = NULL;
+
+    g_free(s->session_subdir);
+    s->session_subdir = NULL;
 
     g_free(s->path);
     s->path = NULL;
@@ -835,7 +913,9 @@ out:
     qemu_co_mutex_unlock(&s->io_lock);
 
     if (ret < 0) {
-        error_reportf_err(local_err, "mfs read failed: ");
+        error_reportf_err(local_err, "mfs read failed offset=%" PRIi64
+                                     " bytes=%" PRIi64 ": ",
+                          offset, bytes);
     }
 
     return ret;
@@ -900,7 +980,9 @@ out:
     qemu_co_mutex_unlock(&s->io_lock);
 
     if (ret < 0) {
-        error_reportf_err(local_err, "mfs write failed: ");
+        error_reportf_err(local_err, "mfs write failed offset=%" PRIi64
+                                     " bytes=%" PRIi64 ": ",
+                          offset, bytes);
     }
 
     return ret;
@@ -992,6 +1074,8 @@ static int coroutine_fn bdrv_mfs_co_create_opts(BlockDriver *drv,
 {
     const char *master = qemu_opt_get(opts, "master");
     const char *path = qemu_opt_get(opts, "path");
+    g_autofree char *session_subdir = NULL;
+    g_autofree char *session_path = NULL;
     uint64_t size;
     MFSConnPool pool;
     uint64_t inode;
@@ -1014,6 +1098,11 @@ static int coroutine_fn bdrv_mfs_co_create_opts(BlockDriver *drv,
     if (!path || !*path) {
         error_setg(errp, "mfs create: missing path option");
         return -EINVAL;
+    }
+
+    ret = mfs_prepare_session_path(path, &session_subdir, &session_path, errp);
+    if (ret < 0) {
+        return ret;
     }
 
     {
@@ -1064,7 +1153,7 @@ static int coroutine_fn bdrv_mfs_co_create_opts(BlockDriver *drv,
             return fd;
         }
 
-        ret = mfs_proto_register_session(fd, "qemu-mfs-create",
+        ret = mfs_proto_register_session(fd, "qemu-mfs-create", session_subdir,
                                          has_password ? password_md5 : NULL,
                                          &master_version, errp);
         if (ret < 0) {
@@ -1074,7 +1163,7 @@ static int coroutine_fn bdrv_mfs_co_create_opts(BlockDriver *drv,
             return ret;
         }
 
-        ret = mfs_proto_master_create_path(fd, master_version, path, size,
+        ret = mfs_proto_master_create_path(fd, master_version, session_path, size,
                                            &inode, errp);
         if (ret < 0) {
             mfs_conn_mark_dead_locked(master_conn);

@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <endian.h>
 #include <errno.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -174,6 +175,59 @@ static int mfs_recv_all(int fd, uint8_t *buf, size_t len, Error **errp)
     return 0;
 }
 
+static int mfs_cs_send_nop(int fd, Error **errp)
+{
+    return mfs_proto_send_packet(fd, MFS_ANTOAN_NOP, NULL, 0, errp);
+}
+
+static int mfs_cs_recv_all(int fd, uint8_t *buf, size_t len, Error **errp)
+{
+    size_t off = 0;
+
+    while (off < len) {
+        struct pollfd pfd = {
+            .fd = fd,
+            .events = POLLIN,
+        };
+        int pret;
+        ssize_t ret;
+
+        pret = poll(&pfd, 1, 1000);
+        if (pret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            error_setg_errno(errp, errno, "mfs: chunkserver poll failed");
+            return -errno;
+        }
+
+        if (pret == 0) {
+            int nop_ret = mfs_cs_send_nop(fd, errp);
+
+            if (nop_ret < 0) {
+                return nop_ret;
+            }
+            continue;
+        }
+
+        ret = recv(fd, buf + off, len - off, 0);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            error_setg_errno(errp, errno, "mfs: recv failed");
+            return -errno;
+        }
+        if (ret == 0) {
+            error_setg(errp, "mfs: peer disconnected");
+            return -EPIPE;
+        }
+        off += ret;
+    }
+
+    return 0;
+}
+
 static void mfs_chunk_replica_free(gpointer data)
 {
     MFSChunkReplica *rep = data;
@@ -256,14 +310,45 @@ int mfs_proto_recv_packet(int fd, uint32_t *type, GByteArray **payload,
     return 0;
 }
 
+static int mfs_proto_cs_recv_packet(int fd, uint32_t *type, GByteArray **payload,
+                                    Error **errp)
+{
+    uint8_t hdr[MFS_PACKET_HEADER_LEN];
+    uint32_t msg_type;
+    uint32_t len;
+    int ret;
+    GByteArray *out;
+
+    ret = mfs_cs_recv_all(fd, hdr, sizeof(hdr), errp);
+    if (ret < 0) {
+        return ret;
+    }
+
+    msg_type = mfs_get_be32(&hdr[0]);
+    len = mfs_get_be32(&hdr[4]);
+
+    out = g_byte_array_sized_new(len);
+    g_byte_array_set_size(out, len);
+
+    if (len) {
+        ret = mfs_cs_recv_all(fd, out->data, len, errp);
+        if (ret < 0) {
+            g_byte_array_unref(out);
+            return ret;
+        }
+    }
+
+    *type = msg_type;
+    *payload = out;
+    return 0;
+}
+
 static int mfs_proto_roundtrip(int fd, uint32_t req_type,
                                const uint8_t *req, uint32_t req_len,
                                uint32_t expected_reply,
                                GByteArray **resp,
                                Error **errp)
 {
-    GByteArray *payload = NULL;
-    uint32_t reply_type;
     int ret;
 
     ret = mfs_proto_send_packet(fd, req_type, req, req_len, errp);
@@ -271,21 +356,32 @@ static int mfs_proto_roundtrip(int fd, uint32_t req_type,
         return ret;
     }
 
-    ret = mfs_proto_recv_packet(fd, &reply_type, &payload, errp);
-    if (ret < 0) {
-        return ret;
-    }
+    for (;;) {
+        GByteArray *payload = NULL;
+        uint32_t reply_type;
 
-    if (expected_reply && reply_type != expected_reply) {
-        g_byte_array_unref(payload);
-        error_setg(errp,
-                   "mfs: unexpected reply type %u for request %u (wanted %u)",
-                   reply_type, req_type, expected_reply);
-        return -EPROTO;
-    }
+        ret = mfs_proto_recv_packet(fd, &reply_type, &payload, errp);
+        if (ret < 0) {
+            return ret;
+        }
 
-    *resp = payload;
-    return 0;
+        if (reply_type == MFS_ANTOAN_NOP) {
+            g_byte_array_unref(payload);
+            continue;
+        }
+
+        if (expected_reply && reply_type != expected_reply) {
+            g_byte_array_unref(payload);
+            error_setg(errp,
+                       "mfs: unexpected reply type %u for request %u "
+                       "(wanted %u)",
+                       reply_type, req_type, expected_reply);
+            return -EPROTO;
+        }
+
+        *resp = payload;
+        return 0;
+    }
 }
 
 static int mfs_proto_expect_msgid(const GByteArray *resp, uint32_t msgid,
@@ -437,55 +533,6 @@ static int mfs_proto_master_simple_lookup(int fd, const char *name,
     return 0;
 }
 
-static int mfs_proto_master_getattr(int fd, uint32_t inode, uint64_t *size_out,
-                                    uint8_t *type_out, Error **errp)
-{
-    uint8_t req[17];
-    GByteArray *resp = NULL;
-    uint32_t msgid = mfs_proto_next_msgid();
-    int ret;
-
-    mfs_put_be32(req + 0, msgid);
-    mfs_put_be32(req + 4, inode);
-    req[8] = 0;
-    mfs_put_be32(req + 9, 0);
-    mfs_put_be32(req + 13, 0);
-
-    ret = mfs_proto_roundtrip(fd, MFS_CLTOMA_FUSE_GETATTR, req, sizeof(req),
-                              MFS_MATOCL_FUSE_GETATTR, &resp, errp);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = mfs_proto_expect_msgid(resp, msgid, errp);
-    if (ret < 0) {
-        g_byte_array_unref(resp);
-        return ret;
-    }
-
-    if (resp->len == 5) {
-        ret = mfs_set_status_error(errp, "getattr", resp->data[4]);
-        g_byte_array_unref(resp);
-        return ret;
-    }
-
-    if (resp->len < 4 + 35) {
-        g_byte_array_unref(resp);
-        error_setg(errp, "mfs: short getattr reply");
-        return -EPROTO;
-    }
-
-    if (type_out) {
-        *type_out = mfs_attr_type(resp->data + 4, resp->len - 4);
-    }
-    if (size_out) {
-        *size_out = mfs_attr_size(resp->data + 4, resp->len - 4);
-    }
-
-    g_byte_array_unref(resp);
-    return 0;
-}
-
 static int mfs_proto_master_opencheck(int fd, uint32_t inode, uint8_t flags,
                                       Error **errp)
 {
@@ -556,10 +603,8 @@ static int mfs_proto_master_create(int fd, const char *name, uint32_t parent_ino
     mfs_payload_append_u8(req, name_len);
     g_byte_array_append(req, (const uint8_t *)name, name_len);
     mfs_payload_append_u16(req, 0644);
-    mfs_payload_append_u16(req, 0);
     mfs_payload_append_u32(req, 0);
-    mfs_payload_append_u32(req, 1);
-    mfs_payload_append_u32(req, 0);
+    mfs_payload_append_u32(req, 0xffffffffU);
 
     ret = mfs_proto_roundtrip(fd, MFS_CLTOMA_FUSE_CREATE, req->data, req->len,
                               MFS_MATOCL_FUSE_CREATE, &resp, errp);
@@ -605,15 +650,12 @@ static int mfs_proto_master_truncate(int fd, uint32_t master_version,
 
     mfs_payload_append_u32(req, msgid);
     mfs_payload_append_u32(req, inode);
-    mfs_payload_append_u8(req, 0);
-    mfs_payload_append_u32(req, 0);
-    mfs_payload_append_u32(req, 1);
-    mfs_payload_append_u32(req, 0);
-    mfs_payload_append_u64(req, size);
-
-    if (master_version >= MFS_VERSION_INT(4, 20, 0)) {
-        mfs_payload_append_u8(req, 1);
+    if (master_version >= MFS_VERSION_INT(2, 0, 0)) {
+        mfs_payload_append_u8(req, 0);
     }
+    mfs_payload_append_u32(req, 0);
+    mfs_payload_append_u32(req, 0xffffffffU);
+    mfs_payload_append_u64(req, size);
 
     ret = mfs_proto_roundtrip(fd, MFS_CLTOMA_FUSE_TRUNCATE,
                               req->data, req->len,
@@ -634,14 +676,16 @@ static int mfs_proto_master_truncate(int fd, uint32_t master_version,
 }
 
 int mfs_proto_register_session(int fd, const char *client_id,
+                               const char *subdir,
                                const uint8_t password_md5[16],
                                uint32_t *master_version, Error **errp)
 {
     GByteArray *req = g_byte_array_new();
     GByteArray *resp = NULL;
     const char *id = client_id ? client_id : "qemu-mfs";
+    const char *reg_subdir = (subdir && *subdir) ? subdir : "/";
     uint32_t info_len = strlen(id) + 1;
-    uint32_t subdir_len = 2;
+    uint32_t subdir_len = strlen(reg_subdir) + 1;
     uint8_t digest[16];
     int ret;
 
@@ -690,7 +734,7 @@ int mfs_proto_register_session(int fd, const char *client_id,
     mfs_payload_append_u32(req, info_len);
     g_byte_array_append(req, (const uint8_t *)id, info_len);
     mfs_payload_append_u32(req, subdir_len);
-    g_byte_array_append(req, (const uint8_t *)"/", subdir_len);
+    g_byte_array_append(req, (const uint8_t *)reg_subdir, subdir_len);
     if (password_md5) {
         g_byte_array_append(req, digest, sizeof(digest));
     }
@@ -919,6 +963,11 @@ static int mfs_decode_chunk_location(const GByteArray *resp, uint32_t msgid,
         p += entry_sz;
     }
 
+    if (loc->replicas->len == 0 &&
+        (loc->length == 0 || (loc->chunk_id == 0 && loc->version == 0))) {
+        return 0;
+    }
+
     if (loc->replicas->len == 0) {
         error_setg(errp, "mfs: chunk metadata has no replicas");
         return -EHOSTUNREACH;
@@ -1041,7 +1090,7 @@ static int mfs_cs_recv_write_status(int fd, uint64_t chunk_id, Error **errp)
     int ret;
 
     for (;;) {
-        ret = mfs_proto_recv_packet(fd, &reply_type, &resp, errp);
+        ret = mfs_proto_cs_recv_packet(fd, &reply_type, &resp, errp);
         if (ret < 0) {
             return ret;
         }
@@ -1102,9 +1151,18 @@ int mfs_proto_cs_read(int fd, const MFSChunkLocation *loc,
     }
 
     for (;;) {
-        ret = mfs_proto_recv_packet(fd, &reply_type, &resp, errp);
+        ret = mfs_proto_cs_recv_packet(fd, &reply_type, &resp, errp);
         if (ret < 0) {
+            error_prepend(errp,
+                          "mfs: chunkserver read chunk=%" PRIu64
+                          " off=%u len=%u received=%u: ",
+                          loc->chunk_id, chunk_offset, length, total);
             return ret;
+        }
+
+        if (reply_type == MFS_ANTOAN_NOP) {
+            g_byte_array_unref(resp);
+            continue;
         }
 
         if (reply_type == MFS_CSTOCL_READ_STATUS) {
@@ -1234,5 +1292,14 @@ int mfs_proto_cs_write(int fd, const MFSChunkLocation *loc,
     ret = mfs_proto_send_packet(fd, MFS_CLTOCS_WRITE_FINISH,
                                 req->data, req->len, errp);
     g_byte_array_unref(req);
-    return ret;
+    if (ret < 0) {
+        return ret;
+    }
+
+    /*
+     * MooseFS last-in-chain writes do not emit a trailing WRITE_STATUS on
+     * successful WRITE_FINISH. The reference client sends WRITE_FINISH and
+     * then reuses/closes the socket without reading another status packet.
+     */
+    return 0;
 }

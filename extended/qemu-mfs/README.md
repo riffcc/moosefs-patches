@@ -39,6 +39,28 @@ qemu-system-x86_64 \
   -drive file.driver=mfs,file.master=mfsmaster.example:9421,file.path=/vm-images/demo.raw,if=virtio,format=mfs
 ```
 
+## Rust-First Prototype
+
+This tree now also carries a Rust-side prototype shim in
+`rust/qemu-mfs-rust/`. It depends on `../mfs-direct-rs` and exports a thin C
+ABI that is intentionally closer to what QEMU needs than to the full MooseFS
+protocol surface:
+
+- connect with either plaintext `password` or QEMU-style `password-md5`
+- open or create-sized files
+- positioned reads and writes
+- cached file size lookup
+
+Build it locally with:
+
+```bash
+cargo build --release --manifest-path rust/qemu-mfs-rust/Cargo.toml
+```
+
+The current C block driver is still present, but the intended direction is to
+turn `block/mfs.c` into a narrow QEMU glue layer and move MooseFS semantics into
+Rust. The Rust static library is the bridge for that migration.
+
 ## Proxmox Direction
 
 For Proxmox VE, the intended integration point is a storage plugin that maps a
@@ -59,3 +81,5 @@ provides the QEMU-side driver and build fragment.
   building a full MooseFS forwarding chain.
 - Full validation still needs an actual QEMU tree build and an integration test
   against a live MooseFS cluster.
+- The Rust prototype is not wired into the C QEMU block driver yet; it is the
+  first concrete step toward a thin-shim architecture.

@@ -9,6 +9,7 @@
 #define MFS_CHUNK_SIZE (64ULL * MiB)
 #define MFS_BLOCK_SIZE (64ULL * KiB)
 #define MFS_ROOT_ID 1
+#define MFS_ANTOAN_NOP 0
 
 #define MFS_VERSION_INT(maj, mid, min) \
     ((((uint32_t)(maj)) << 16) | (((uint32_t)(mid)) << 8) | ((uint32_t)(min)))
@@ -80,6 +81,7 @@ int mfs_proto_recv_packet(int fd, uint32_t *type, GByteArray **payload,
                           Error **errp);
 
 int mfs_proto_register_session(int fd, const char *client_id,
+                               const char *subdir,
                                const uint8_t password_md5[16],
                                uint32_t *master_version, Error **errp);
 int mfs_proto_master_lookup_path(int fd, uint32_t master_version,
