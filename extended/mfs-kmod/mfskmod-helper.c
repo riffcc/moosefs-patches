@@ -3889,11 +3889,15 @@ static int read_state_read_data(struct helper_session *s,
 				uint8_t **out, uint32_t *out_len)
 {
 	uint64_t off = req->offset;
+	uint32_t max_reply = MFS_CTRL_MAX_PAYLOAD - sizeof(struct mfs_ctrl_read_rsp);
 	uint32_t remain = req->size;
 	uint32_t got_total = 0;
 	uint8_t *payload;
 	struct mfs_ctrl_read_rsp *rr;
 	int ret = 0;
+
+	if (remain > max_reply)
+		remain = max_reply;
 
 	payload = calloc(1, sizeof(*rr) + remain);
 	if (!payload)
