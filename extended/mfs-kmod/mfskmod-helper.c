@@ -165,7 +165,9 @@ struct read_state {
 	uint32_t meta_lane_id;
 	uint32_t preferred_ip;
 	uint16_t preferred_port;
+	uint32_t stripe_inode;
 	uint64_t stripe_band;
+	uint64_t stripe_generation;
 	uint32_t stripe_base_chunk;
 	uint32_t stripe_chunk_count;
 	uint32_t stripe_plan_next_slot;
@@ -578,7 +580,9 @@ static void read_state_reset_prefetch(struct read_state *rs)
 
 static void read_state_reset_stripe(struct read_state *rs)
 {
+	rs->stripe_inode = 0;
 	rs->stripe_band = 0;
+	rs->stripe_generation = 0;
 	rs->stripe_base_chunk = 0;
 	rs->stripe_chunk_count = 0;
 	rs->stripe_plan_next_slot = 0;
@@ -3706,7 +3710,7 @@ static void read_state_prepare_stripe(struct read_state *rs,
 	uint64_t band = mfs_read_chunk_band(chunk_idx);
 	uint32_t base = (chunk_idx / chunks_per_band) * chunks_per_band;
 
-	if (rs->inode == inode &&
+	if (rs->stripe_inode == inode &&
 	    rs->stripe_chunk_count > 0 &&
 	    rs->stripe_band == band &&
 	    chunk_idx >= rs->stripe_base_chunk &&
@@ -3714,13 +3718,16 @@ static void read_state_prepare_stripe(struct read_state *rs,
 		return;
 
 	read_state_reset_stripe(rs);
+	rs->stripe_inode = inode;
 	rs->stripe_band = band;
+	rs->stripe_generation++;
 	rs->stripe_base_chunk = base;
 	rs->stripe_chunk_count = chunks_per_band;
 	rs->stripe_plan_next_slot = 0;
 	rs->stripe_plan_complete = false;
-	vlog("read_stripe: inode=%u band=%llu base_chunk=%u chunk_count=%u focus_chunk=%u",
-	     inode, (unsigned long long)band, base, chunks_per_band, chunk_idx);
+	vlog("read_stripe: inode=%u gen=%llu band=%llu base_chunk=%u chunk_count=%u focus_chunk=%u",
+	     inode, (unsigned long long)rs->stripe_generation,
+	     (unsigned long long)band, base, chunks_per_band, chunk_idx);
 }
 
 static struct read_stripe_meta_entry *read_state_stripe_slot(struct read_state *rs,
