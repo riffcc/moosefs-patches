@@ -240,6 +240,15 @@ static int read_state_read_data(struct helper_session *s,
 				struct read_state *rs,
 				const struct mfs_ctrl_read_req *req,
 				uint8_t **out, uint32_t *out_len);
+static int read_state_fetch_window(struct helper_session *s,
+				   struct read_state *rs,
+				   uint32_t inode,
+				   uint32_t chunk_idx,
+				   const struct chunk_meta *m,
+				   uint32_t chunk_off,
+				   uint32_t fetch_len,
+				   uint8_t *fetch_buf,
+				   uint32_t *got_out);
 
 static void session_reset_read_meta_cache(struct helper_session *s)
 {
@@ -302,6 +311,13 @@ static void read_state_destroy(struct read_state *rs)
 	rs->cs_port = 0;
 	rs->preferred_ip = 0;
 	rs->preferred_port = 0;
+}
+
+static bool cs_loc_matches(const struct cs_loc *a, const struct cs_loc *b)
+{
+	if (!a || !b)
+		return false;
+	return a->ip == b->ip && a->port == b->port;
 }
 
 static void session_reset_read_scoreboard(struct helper_session *s)
@@ -1101,6 +1117,15 @@ static bool packet_is_unsolicited(uint32_t type, const uint8_t *data, uint32_t l
 	return false;
 }
 
+static bool packet_is_benign_keepalive(uint32_t type, const uint8_t *data, uint32_t len)
+{
+	if (type == ANTOAN_NOP && len == 4)
+		return true;
+	if (type == 0 && len == 4 && data && get32be(data) == 0)
+		return true;
+	return false;
+}
+
 static bool master_conn_broken(int ret)
 {
 	return ret == -EPIPE || ret == -ECONNRESET || ret == -ENOTCONN;
@@ -1289,6 +1314,7 @@ static int master_idle_pump(struct helper_session *s)
 	uint32_t pkt_len = 0;
 	time_t now = time(NULL);
 	int ret;
+	unsigned int drained = 0;
 
 	if (s->master_fd < 0)
 		return -ENOTCONN;
@@ -1300,30 +1326,41 @@ static int master_idle_pump(struct helper_session *s)
 		s->master_last_nop = now;
 	}
 
-	pfd.fd = s->master_fd;
-	pfd.events = POLLIN;
-	pfd.revents = 0;
-	ret = poll(&pfd, 1, 250);
-	if (ret <= 0)
-		return ret;
-	if (!(pfd.revents & (POLLIN | POLLERR | POLLHUP)))
-		return 0;
-	if (pfd.revents & (POLLERR | POLLHUP))
-		return -ECONNRESET;
+	for (;;) {
+		int timeout_ms = drained == 0 ? 250 : 0;
 
-	ret = master_recv_packet(s->master_fd, &got_type, &pkt, &pkt_len);
-	if (ret)
-		return ret;
-	if (packet_is_unsolicited(got_type, pkt, pkt_len)) {
-		vlog("master idle: skipped unsolicited packet type=0x%08x len=%u",
+		pfd.fd = s->master_fd;
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+		ret = poll(&pfd, 1, timeout_ms);
+		if (ret <= 0)
+			return ret;
+		if (!(pfd.revents & (POLLIN | POLLERR | POLLHUP)))
+			return 0;
+		if (pfd.revents & (POLLERR | POLLHUP))
+			return -ECONNRESET;
+
+		ret = master_recv_packet(s->master_fd, &got_type, &pkt, &pkt_len);
+		if (ret)
+			return ret;
+		if (packet_is_unsolicited(got_type, pkt, pkt_len)) {
+			bool benign_keepalive = packet_is_benign_keepalive(got_type, pkt, pkt_len);
+
+			if (!benign_keepalive) {
+				vlog("master idle: skipped unsolicited packet type=0x%08x len=%u",
+				     got_type, pkt_len);
+			}
+			free(pkt);
+			pkt = NULL;
+			if (++drained >= HELPER_MASTER_MAX_SKIPPED_PKTS)
+				return 0;
+			continue;
+		}
+		vlog("master idle: unexpected packet type=0x%08x len=%u",
 		     got_type, pkt_len);
 		free(pkt);
-		return 0;
+		return -EPROTO;
 	}
-	vlog("master idle: unexpected packet type=0x%08x len=%u",
-	     got_type, pkt_len);
-	free(pkt);
-	return -EPROTO;
 }
 
 static int master_rpc_once(struct helper_session *s,
@@ -1365,11 +1402,16 @@ static int master_rpc_once(struct helper_session *s,
 		}
 		if (got_type != rsp_type) {
 			if (packet_is_unsolicited(got_type, pkt, pkt_len)) {
-				vlog("master_rpc: skipped unsolicited packet type=0x%08x len=%u",
-				     got_type, pkt_len);
+				bool benign_keepalive = packet_is_benign_keepalive(got_type, pkt, pkt_len);
+
+				if (!benign_keepalive) {
+					vlog("master_rpc: skipped unsolicited packet type=0x%08x len=%u",
+					     got_type, pkt_len);
+				}
 				free(pkt);
 				pkt = NULL;
-				if (++skipped > HELPER_MASTER_MAX_SKIPPED_PKTS)
+				if (!benign_keepalive &&
+				    ++skipped > HELPER_MASTER_MAX_SKIPPED_PKTS)
 					return -EPROTO;
 				continue;
 			}
@@ -3336,18 +3378,12 @@ static int cs_read_data(const struct chunk_meta *m, uint32_t chunk_off,
 static int read_state_get_cs_fd(struct read_state *rs,
 				struct helper_session *s,
 				uint32_t inode,
-				uint32_t chunk_idx,
-				const struct chunk_meta *m)
+				const struct cs_loc *loc)
 {
-	const struct cs_loc *loc;
 	char ipbuf[64];
 	struct in_addr ia;
 	int fd;
 
-	if (m->loc_count == 0)
-		return -ENOSPC;
-
-	loc = choose_read_replica(s, rs, inode, chunk_idx, m);
 	if (!loc)
 		return -ENOSPC;
 
@@ -3379,6 +3415,7 @@ static int read_state_get_cs_fd(struct read_state *rs,
 }
 
 static int cs_read_data_on_fd(int fd, const struct chunk_meta *m,
+			      const struct cs_loc *loc,
 			      uint32_t chunk_off, const uint32_t want,
 			      uint8_t *dst, uint32_t *got)
 {
@@ -3388,8 +3425,7 @@ static int cs_read_data_on_fd(int fd, const struct chunk_meta *m,
 	uint32_t total = 0;
 	int ret;
 
-	cs_protover = (m->loc_count > 0 &&
-		       m->locs[0].cs_ver >= VERSION2INT(1, 7, 32)) ? 1 : 0;
+	cs_protover = (loc && loc->cs_ver >= VERSION2INT(1, 7, 32)) ? 1 : 0;
 
 	if (cs_protover > 0)
 		pkt_len = 1 + 8 + 4 + 4 + 4;
@@ -3473,6 +3509,61 @@ static int cs_read_data_on_fd(int fd, const struct chunk_meta *m,
 		free(rsp);
 		return -EPROTO;
 	}
+}
+
+static int read_state_fetch_window(struct helper_session *s,
+				   struct read_state *rs,
+				   uint32_t inode,
+				   uint32_t chunk_idx,
+				   const struct chunk_meta *m,
+				   uint32_t chunk_off,
+				   uint32_t fetch_len,
+				   uint8_t *fetch_buf,
+				   uint32_t *got_out)
+{
+	const struct cs_loc *preferred;
+	int ret = -ENOSPC;
+	uint32_t i;
+
+	if (!m || m->loc_count == 0)
+		return -ENOSPC;
+
+	preferred = choose_read_replica(s, rs, inode, chunk_idx, m);
+	if (preferred) {
+		int csfd = read_state_get_cs_fd(rs, s, inode, preferred);
+
+		if (csfd >= 0) {
+			ret = cs_read_data_on_fd(csfd, m, preferred, chunk_off, fetch_len,
+						 fetch_buf, got_out);
+			if (ret == 0)
+				return 0;
+		} else {
+			ret = csfd;
+		}
+		read_state_invalidate(rs);
+	}
+
+	for (i = 0; i < m->loc_count; i++) {
+		const struct cs_loc *loc = &m->locs[i];
+		int csfd;
+
+		if (preferred && cs_loc_matches(loc, preferred))
+			continue;
+
+		csfd = read_state_get_cs_fd(rs, s, inode, loc);
+		if (csfd < 0) {
+			ret = csfd;
+			continue;
+		}
+
+		ret = cs_read_data_on_fd(csfd, m, loc, chunk_off, fetch_len,
+					 fetch_buf, got_out);
+		if (ret == 0)
+			return 0;
+		read_state_invalidate(rs);
+	}
+
+	return ret;
 }
 
 static int cs_recv_write_status(int fd, uint64_t want_chunkid,
@@ -3819,8 +3910,6 @@ static int read_state_read_data(struct helper_session *s,
 		uint32_t fetch_len;
 		uint8_t *fetch_buf = NULL;
 		struct chunk_meta meta;
-		int csfd;
-
 		if (can > remain)
 			can = remain;
 
@@ -3865,11 +3954,6 @@ static int read_state_read_data(struct helper_session *s,
 			}
 		}
 
-		csfd = read_state_get_cs_fd(rs, s, req->inode, chunk_idx, &meta);
-		if (csfd < 0) {
-			ret = csfd;
-			goto out;
-		}
 		fetch_off = chunk_off;
 		fetch_len = can;
 		/*
@@ -3895,15 +3979,15 @@ static int read_state_read_data(struct helper_session *s,
 		pthread_mutex_lock(&s->read_prefetch_mu);
 		s->read_foreground_inflight++;
 		pthread_mutex_unlock(&s->read_prefetch_mu);
-		ret = cs_read_data_on_fd(csfd, &meta, fetch_off, fetch_len,
-					 fetch_buf, &got);
+		ret = read_state_fetch_window(s, rs, req->inode, chunk_idx, &meta,
+					      fetch_off, fetch_len, fetch_buf, &got);
 		pthread_mutex_lock(&s->read_prefetch_mu);
-		if (s->read_foreground_inflight > 0)
+		if (s->read_foreground_inflight > 0) {
 			s->read_foreground_inflight--;
+		}
 		pthread_cond_broadcast(&s->read_prefetch_cv);
 		pthread_mutex_unlock(&s->read_prefetch_mu);
 		if (ret) {
-			read_state_invalidate(rs);
 			goto out;
 		}
 		if (got == 0) {
