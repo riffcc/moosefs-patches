@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -20,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../../mfscommon/md5.h"
 #include "mfs_ctrl_proto.h"
 /* Userspace-safe MooseFS wire protocol constants */
 #include "mfs_wire_defs.h"
@@ -28,6 +30,24 @@
 #define HELPER_INFO_STR "mfskmod-helper"
 #define HELPER_CS_TIMEOUT_MS 12000
 #define HELPER_MASTER_TIMEOUT_MS 12000
+#define HELPER_MASTER_MAX_SKIPPED_PKTS 128
+#define HELPER_READ_CACHE_MAX (64U * 1024U * 1024U)
+#define HELPER_READ_PREFETCH_BASE (16U * 1024U * 1024U)
+#define HELPER_READ_PREFETCH_MAX (64U * 1024U * 1024U)
+#define HELPER_READ_SEQ_TRIGGER (2U * 1024U * 1024U)
+#define HELPER_READ_SCOREBOARD_MAX 32
+#define HELPER_READ_META_CACHE_MAX 64
+#define HELPER_READ_FOREGROUND_MAX (4U * 1024U * 1024U)
+#define HELPER_READ_WORKERS 2
+#define HELPER_READ_JOB_QUEUE_MAX 32
+#define HELPER_READ_REPLICA_LOOKAHEAD 4U
+#define HELPER_READ_PREFETCH_WORKERS 1
+#define HELPER_READ_PREFETCH_QUEUE_MAX 2
+#define HELPER_READ_PREFETCH_DATA_CACHE_MAX 2
+#define HELPER_READ_PREFETCH_WORKER_MAX (8U * 1024U * 1024U)
+#define VERSION2INT(maj,mid,min) ((maj) * 0x10000U + (mid) * 0x100U + (((maj) > 1) ? ((min) * 2U) : (min)))
+#define CHUNKOPFLAG_CANMODTIME 1U
+#define CHUNKOPFLAG_CONTINUEOP 2U
 
 struct cs_loc {
 	uint32_t ip;
@@ -45,16 +65,647 @@ struct chunk_meta {
 	struct cs_loc locs[16];
 };
 
+struct range_span {
+	uint32_t start;
+	uint32_t end;
+};
+
+struct read_meta_cache_entry {
+	bool valid;
+	uint32_t inode;
+	uint32_t chunk_idx;
+	int status;
+	struct chunk_meta meta;
+	uint64_t stamp;
+};
+
+struct read_prefetch_request {
+	bool valid;
+	uint32_t inode;
+	uint32_t chunk_idx;
+	uint32_t chunk_off;
+	uint32_t fetch_len;
+};
+
+struct read_prefetch_data_entry {
+	bool valid;
+	uint32_t inode;
+	uint32_t chunk_idx;
+	uint32_t base;
+	uint32_t len;
+	uint8_t *buf;
+	uint32_t cap;
+	uint64_t stamp;
+};
+
+struct read_state {
+	bool meta_valid;
+	int meta_status;
+	uint32_t inode;
+	uint32_t chunk_idx;
+	struct chunk_meta meta;
+	int cs_fd;
+	uint32_t cs_ip;
+	uint16_t cs_port;
+	uint8_t *cache_buf;
+	uint32_t cache_cap;
+	uint32_t cache_base;
+	uint32_t scoreboard_count;
+	struct range_span scoreboard[HELPER_READ_SCOREBOARD_MAX];
+	uint32_t prefetch_len;
+	uint64_t last_end;
+	uint64_t seq_bytes;
+	uint32_t preferred_ip;
+	uint16_t preferred_port;
+};
+
+struct read_job {
+	bool valid;
+	struct mfs_ctrl_hdr hdr;
+	uint8_t *payload;
+	uint32_t payload_len;
+};
+
 struct helper_session {
 	bool active;
 	int master_fd;
 	uint32_t next_msgid;
 	uint32_t session_id;
+	uint32_t master_version;
 	uint8_t attr_size;
 	char master_host[256];
 	uint16_t master_port;
 	char subdir[MFS_PATH_MAX + 1];
+	pthread_t master_thread;
+	pthread_mutex_t master_mu;
+	pthread_cond_t master_cv;
+	bool master_thread_running;
+	bool master_thread_stop;
+	bool master_req_pending;
+	bool master_req_done;
+	uint32_t master_req_type;
+	uint8_t *master_req_data;
+	uint32_t master_req_len;
+	uint32_t master_rsp_type;
+	uint8_t *master_rsp_data;
+	uint32_t master_rsp_len;
+	int master_rsp_status;
+	time_t master_last_nop;
+	bool read_meta_valid;
+	int read_meta_status;
+	uint32_t read_inode;
+	uint32_t read_chunk_idx;
+	struct chunk_meta read_meta;
+	int read_cs_fd;
+	uint32_t read_cs_ip;
+	uint16_t read_cs_port;
+	uint8_t *read_cache_buf;
+	uint32_t read_cache_cap;
+	uint32_t read_cache_base;
+	uint32_t read_scoreboard_count;
+	struct range_span read_scoreboard[HELPER_READ_SCOREBOARD_MAX];
+	uint32_t read_prefetch_len;
+	uint64_t read_last_end;
+	uint64_t read_seq_bytes;
+	pthread_t read_prefetch_threads[HELPER_READ_PREFETCH_WORKERS];
+	pthread_t read_workers[HELPER_READ_WORKERS];
+	pthread_mutex_t read_prefetch_mu;
+	pthread_cond_t read_prefetch_cv;
+	bool read_prefetch_thread_running;
+	bool read_prefetch_thread_stop;
+	uint32_t read_foreground_inflight;
+	uint64_t read_meta_cache_clock;
+	struct read_meta_cache_entry read_meta_cache[HELPER_READ_META_CACHE_MAX];
+	uint64_t read_prefetch_data_clock;
+	struct read_prefetch_request read_prefetch_queue[HELPER_READ_PREFETCH_QUEUE_MAX];
+	struct read_prefetch_data_entry read_prefetch_data[HELPER_READ_PREFETCH_DATA_CACHE_MAX];
+	pthread_mutex_t read_job_mu;
+	pthread_cond_t read_job_cv;
+	struct read_job read_jobs[HELPER_READ_JOB_QUEUE_MAX];
+	bool read_worker_running;
+	bool read_worker_stop;
+	int ctrl_fd;
+	pthread_mutex_t ctrl_write_mu;
+	bool write_meta_valid;
+	uint32_t write_inode;
+	uint32_t write_chunk_idx;
+	struct chunk_meta write_meta;
+	uint64_t write_file_size;
+	uint32_t write_min_chunk_off;
+	uint32_t write_max_chunk_end;
+	int write_cs_fd;
+	uint32_t write_cs_ip;
+	uint16_t write_cs_port;
+	bool write_cs_active;
+	uint32_t write_next_writeid;
 };
+
+static int session_write_chunk_end(struct helper_session *s,
+				   uint32_t inode, uint32_t chunk_idx,
+				   uint64_t chunkid, uint64_t file_size,
+				   uint32_t chunk_off, uint32_t write_size);
+static int session_finalize_active_write(struct helper_session *s);
+static int session_read_chunk_meta(struct helper_session *s,
+				   uint32_t inode, uint32_t chunk_idx,
+				   struct chunk_meta *m);
+static const struct cs_loc *choose_read_replica(struct helper_session *s,
+						const struct read_state *rs,
+						uint32_t inode,
+						uint32_t chunk_idx,
+						const struct chunk_meta *m);
+static int cs_read_data(const struct chunk_meta *m, uint32_t chunk_off,
+			uint32_t want, uint8_t *dst, uint32_t *got);
+static int cs_send_packet(int fd, uint32_t type, const void *data, uint32_t len);
+static void read_state_init(struct read_state *rs);
+static void read_state_reset_scoreboard(struct read_state *rs);
+static void read_state_reset_prefetch(struct read_state *rs);
+static void read_state_destroy(struct read_state *rs);
+static int read_state_prepare_window(struct read_state *rs,
+				     uint32_t start, uint32_t len,
+				     uint8_t **dst_out);
+static void read_state_commit_window(struct read_state *rs,
+				     uint32_t start, uint32_t len);
+static int read_state_read_data(struct helper_session *s,
+				struct read_state *rs,
+				const struct mfs_ctrl_read_req *req,
+				uint8_t **out, uint32_t *out_len);
+
+static void session_reset_read_meta_cache(struct helper_session *s)
+{
+	size_t i;
+
+	pthread_mutex_lock(&s->read_prefetch_mu);
+	memset(s->read_meta_cache, 0, sizeof(s->read_meta_cache));
+	s->read_meta_cache_clock = 0;
+	s->read_foreground_inflight = 0;
+	memset(s->read_prefetch_queue, 0, sizeof(s->read_prefetch_queue));
+	for (i = 0; i < HELPER_READ_PREFETCH_DATA_CACHE_MAX; i++) {
+		free(s->read_prefetch_data[i].buf);
+		memset(&s->read_prefetch_data[i], 0, sizeof(s->read_prefetch_data[i]));
+	}
+	s->read_prefetch_data_clock = 0;
+	pthread_cond_broadcast(&s->read_prefetch_cv);
+	pthread_mutex_unlock(&s->read_prefetch_mu);
+}
+
+static void read_state_init(struct read_state *rs)
+{
+	memset(rs, 0, sizeof(*rs));
+	rs->cs_fd = -1;
+	rs->prefetch_len = HELPER_READ_PREFETCH_BASE;
+}
+
+static void read_state_reset_scoreboard(struct read_state *rs)
+{
+	free(rs->cache_buf);
+	rs->cache_buf = NULL;
+	rs->cache_cap = 0;
+	rs->cache_base = 0;
+	rs->scoreboard_count = 0;
+	memset(rs->scoreboard, 0, sizeof(rs->scoreboard));
+}
+
+static void read_state_reset_prefetch(struct read_state *rs)
+{
+	rs->prefetch_len = HELPER_READ_PREFETCH_BASE;
+	rs->last_end = 0;
+	rs->seq_bytes = 0;
+}
+
+static void read_state_destroy(struct read_state *rs)
+{
+	if (rs->cs_fd >= 0) {
+		close(rs->cs_fd);
+		rs->cs_fd = -1;
+	}
+	read_state_reset_scoreboard(rs);
+	read_state_reset_prefetch(rs);
+	rs->meta_valid = false;
+	rs->meta_status = 0;
+	rs->inode = 0;
+	rs->chunk_idx = 0;
+	memset(&rs->meta, 0, sizeof(rs->meta));
+	rs->cs_ip = 0;
+	rs->cs_port = 0;
+	rs->preferred_ip = 0;
+	rs->preferred_port = 0;
+}
+
+static void session_reset_read_scoreboard(struct helper_session *s)
+{
+	free(s->read_cache_buf);
+	s->read_cache_buf = NULL;
+	s->read_cache_cap = 0;
+	s->read_cache_base = 0;
+	s->read_scoreboard_count = 0;
+	memset(s->read_scoreboard, 0, sizeof(s->read_scoreboard));
+}
+
+static void session_reset_read_prefetch(struct helper_session *s)
+{
+	s->read_prefetch_len = HELPER_READ_PREFETCH_BASE;
+	s->read_last_end = 0;
+	s->read_seq_bytes = 0;
+}
+
+static int session_prepare_read_window(struct helper_session *s,
+				       uint32_t start, uint32_t len,
+				       uint8_t **dst_out)
+{
+	struct read_state rs = {
+		.cache_buf = s->read_cache_buf,
+		.cache_cap = s->read_cache_cap,
+		.cache_base = s->read_cache_base,
+		.scoreboard_count = s->read_scoreboard_count,
+		.prefetch_len = s->read_prefetch_len,
+	};
+	int ret;
+
+	memcpy(rs.scoreboard, s->read_scoreboard, sizeof(rs.scoreboard));
+	ret = read_state_prepare_window(&rs, start, len, dst_out);
+	s->read_cache_buf = rs.cache_buf;
+	s->read_cache_cap = rs.cache_cap;
+	s->read_cache_base = rs.cache_base;
+	s->read_scoreboard_count = rs.scoreboard_count;
+	memcpy(s->read_scoreboard, rs.scoreboard, sizeof(s->read_scoreboard));
+	return ret;
+}
+
+static void session_commit_read_window(struct helper_session *s,
+				       uint32_t start, uint32_t len)
+{
+	struct read_state rs = {
+		.cache_buf = s->read_cache_buf,
+		.cache_cap = s->read_cache_cap,
+		.cache_base = s->read_cache_base,
+		.scoreboard_count = s->read_scoreboard_count,
+	};
+
+	memcpy(rs.scoreboard, s->read_scoreboard, sizeof(rs.scoreboard));
+	read_state_commit_window(&rs, start, len);
+	s->read_cache_base = rs.cache_base;
+	s->read_scoreboard_count = rs.scoreboard_count;
+	memcpy(s->read_scoreboard, rs.scoreboard, sizeof(s->read_scoreboard));
+}
+
+static bool session_lookup_read_meta_cache(struct helper_session *s,
+					   uint32_t inode, uint32_t chunk_idx,
+					   struct chunk_meta *m,
+					   int *status)
+{
+	bool found = false;
+	size_t i;
+
+	pthread_mutex_lock(&s->read_prefetch_mu);
+	for (i = 0; i < HELPER_READ_META_CACHE_MAX; i++) {
+		struct read_meta_cache_entry *ent = &s->read_meta_cache[i];
+
+		if (!ent->valid)
+			continue;
+		if (ent->inode != inode || ent->chunk_idx != chunk_idx)
+			continue;
+		ent->stamp = ++s->read_meta_cache_clock;
+		if (status)
+			*status = ent->status;
+		if (m)
+			*m = ent->meta;
+		found = true;
+		break;
+	}
+	pthread_mutex_unlock(&s->read_prefetch_mu);
+	return found;
+}
+
+static void session_store_read_meta_cache(struct helper_session *s,
+					  uint32_t inode, uint32_t chunk_idx,
+					  int status,
+					  const struct chunk_meta *m)
+{
+	struct read_meta_cache_entry *victim = NULL;
+	size_t i;
+
+	pthread_mutex_lock(&s->read_prefetch_mu);
+	for (i = 0; i < HELPER_READ_META_CACHE_MAX; i++) {
+		struct read_meta_cache_entry *ent = &s->read_meta_cache[i];
+
+		if (ent->valid &&
+		    ent->inode == inode &&
+		    ent->chunk_idx == chunk_idx) {
+			victim = ent;
+			break;
+		}
+		if (!victim || !victim->valid || ent->stamp < victim->stamp)
+			victim = ent;
+	}
+	if (victim) {
+		memset(victim, 0, sizeof(*victim));
+		victim->valid = true;
+		victim->inode = inode;
+		victim->chunk_idx = chunk_idx;
+		victim->status = status;
+		if (m)
+			victim->meta = *m;
+		victim->stamp = ++s->read_meta_cache_clock;
+	}
+	pthread_mutex_unlock(&s->read_prefetch_mu);
+}
+
+static void session_schedule_read_meta_prefetch(struct helper_session *s,
+						uint32_t inode,
+						uint32_t chunk_idx,
+						uint32_t chunk_off,
+						uint32_t fetch_len)
+{
+	size_t i;
+	size_t free_slot = HELPER_READ_PREFETCH_QUEUE_MAX;
+
+	pthread_mutex_lock(&s->read_prefetch_mu);
+	if (!s->read_prefetch_thread_running || s->read_prefetch_thread_stop) {
+		pthread_mutex_unlock(&s->read_prefetch_mu);
+		return;
+	}
+	for (i = 0; i < HELPER_READ_PREFETCH_DATA_CACHE_MAX; i++) {
+		struct read_prefetch_data_entry *ent = &s->read_prefetch_data[i];
+
+		if (ent->valid &&
+		    ent->inode == inode &&
+		    ent->chunk_idx == chunk_idx &&
+		    ent->base == chunk_off &&
+		    ent->len >= fetch_len) {
+			pthread_mutex_unlock(&s->read_prefetch_mu);
+			return;
+		}
+	}
+	for (i = 0; i < HELPER_READ_PREFETCH_QUEUE_MAX; i++) {
+		struct read_prefetch_request *req = &s->read_prefetch_queue[i];
+
+		if (req->valid &&
+		    req->inode == inode &&
+		    req->chunk_idx == chunk_idx &&
+		    req->chunk_off == chunk_off &&
+		    req->fetch_len == fetch_len) {
+			pthread_mutex_unlock(&s->read_prefetch_mu);
+			return;
+		}
+		if (!req->valid && free_slot == HELPER_READ_PREFETCH_QUEUE_MAX)
+			free_slot = i;
+	}
+	if (free_slot == HELPER_READ_PREFETCH_QUEUE_MAX) {
+		pthread_mutex_unlock(&s->read_prefetch_mu);
+		return;
+	}
+	s->read_prefetch_queue[free_slot].valid = true;
+	s->read_prefetch_queue[free_slot].inode = inode;
+	s->read_prefetch_queue[free_slot].chunk_idx = chunk_idx;
+	s->read_prefetch_queue[free_slot].chunk_off = chunk_off;
+	s->read_prefetch_queue[free_slot].fetch_len = fetch_len;
+	pthread_cond_broadcast(&s->read_prefetch_cv);
+	pthread_mutex_unlock(&s->read_prefetch_mu);
+}
+
+static bool session_try_use_prefetched_read(struct helper_session *s,
+					    uint32_t inode, uint32_t chunk_idx,
+					    uint32_t chunk_off, uint32_t want)
+{
+	struct read_prefetch_data_entry *best = NULL;
+	uint8_t *tmp = NULL;
+	uint32_t base = 0;
+	uint32_t len = 0;
+	uint8_t *dst = NULL;
+	size_t i;
+	int ret;
+
+	pthread_mutex_lock(&s->read_prefetch_mu);
+	for (i = 0; i < HELPER_READ_PREFETCH_DATA_CACHE_MAX; i++) {
+		struct read_prefetch_data_entry *ent = &s->read_prefetch_data[i];
+
+		if (!ent->valid)
+			continue;
+		if (ent->inode != inode || ent->chunk_idx != chunk_idx)
+			continue;
+		if (ent->base > chunk_off || ent->base + ent->len < chunk_off + want)
+			continue;
+		if (!best || ent->stamp > best->stamp)
+			best = ent;
+	}
+	if (best) {
+		base = best->base;
+		len = best->len;
+		best->stamp = ++s->read_prefetch_data_clock;
+		tmp = malloc(len);
+		if (tmp)
+			memcpy(tmp, best->buf, len);
+	}
+	pthread_mutex_unlock(&s->read_prefetch_mu);
+
+	if (!tmp)
+		return false;
+
+	ret = session_prepare_read_window(s, base, len, &dst);
+	if (ret) {
+		free(tmp);
+		return false;
+	}
+	memcpy(dst, tmp, len);
+	free(tmp);
+	session_commit_read_window(s, base, len);
+	return true;
+}
+
+static void session_schedule_read_ahead(struct helper_session *s,
+					uint32_t inode,
+					uint32_t chunk_idx)
+{
+	uint32_t len = s->read_prefetch_len;
+	uint32_t i;
+
+	if (len > HELPER_READ_PREFETCH_WORKER_MAX)
+		len = HELPER_READ_PREFETCH_WORKER_MAX;
+	for (i = 0; i < HELPER_READ_REPLICA_LOOKAHEAD; i++)
+		session_schedule_read_meta_prefetch(s, inode, chunk_idx + i, 0, len);
+}
+
+static const struct cs_loc *choose_read_replica(struct helper_session *s,
+						const struct read_state *rs,
+						uint32_t inode,
+						uint32_t chunk_idx,
+						const struct chunk_meta *m)
+{
+	struct chunk_meta future_meta;
+	int future_status = 0;
+	uint32_t best_score = 0;
+	const struct cs_loc *best = NULL;
+	uint32_t i;
+	uint32_t j;
+	uint32_t k;
+
+	if (!m || m->loc_count == 0)
+		return NULL;
+
+	for (i = 0; i < m->loc_count; i++) {
+		if (rs->cs_fd >= 0 &&
+		    rs->cs_ip == m->locs[i].ip &&
+		    rs->cs_port == m->locs[i].port)
+			return &m->locs[i];
+	}
+
+	for (i = 0; i < m->loc_count; i++) {
+		uint32_t score = 0;
+
+		if (rs->preferred_ip == m->locs[i].ip &&
+		    rs->preferred_port == m->locs[i].port)
+			score += 8;
+
+		for (k = 1; k <= HELPER_READ_REPLICA_LOOKAHEAD; k++) {
+			if (!session_lookup_read_meta_cache(s, inode, chunk_idx + k,
+							    &future_meta, &future_status) ||
+			    future_status != 0)
+				continue;
+			for (j = 0; j < future_meta.loc_count; j++) {
+				if (m->locs[i].ip == future_meta.locs[j].ip &&
+				    m->locs[i].port == future_meta.locs[j].port) {
+					score += (HELPER_READ_REPLICA_LOOKAHEAD + 1U - k);
+					break;
+				}
+			}
+		}
+		if (!best || score > best_score) {
+			best = &m->locs[i];
+			best_score = score;
+		}
+	}
+
+	if (best)
+		return best;
+
+	for (i = 0; i < m->loc_count; i++) {
+		if (rs->preferred_ip == m->locs[i].ip &&
+		    rs->preferred_port == m->locs[i].port)
+			return &m->locs[i];
+	}
+
+	return &m->locs[0];
+}
+
+static void read_state_note_progress(struct read_state *rs,
+				     uint32_t inode,
+				     uint64_t start,
+				     uint32_t len)
+{
+	uint64_t end = start + len;
+
+	if (len == 0)
+		return;
+	if (rs->inode != inode) {
+		rs->seq_bytes = len;
+		rs->prefetch_len = HELPER_READ_PREFETCH_BASE;
+	} else if (start == rs->last_end) {
+		rs->seq_bytes += len;
+		if (rs->seq_bytes >= HELPER_READ_SEQ_TRIGGER &&
+		    rs->prefetch_len < HELPER_READ_PREFETCH_MAX) {
+			rs->prefetch_len <<= 1;
+			if (rs->prefetch_len > HELPER_READ_PREFETCH_MAX)
+				rs->prefetch_len = HELPER_READ_PREFETCH_MAX;
+		}
+	} else {
+		rs->seq_bytes = len;
+		rs->prefetch_len = HELPER_READ_PREFETCH_BASE;
+	}
+	rs->last_end = end;
+}
+
+static void read_state_add_coverage(struct read_state *rs,
+				    uint32_t start, uint32_t end)
+{
+	if (start >= end)
+		return;
+
+	/*
+	 * Keep the first implementation deliberately simple: one proven span
+	 * representing the cached window we most recently fetched. The fixed
+	 * scoreboard shape stays in place so we can later expand to multiple
+	 * spans or true OOO retirement without changing the session model.
+	 */
+	rs->scoreboard[0].start = start;
+	rs->scoreboard[0].end = end;
+	rs->scoreboard_count = 1;
+}
+
+static uint32_t read_state_cached_prefix_len(struct read_state *rs,
+					     uint32_t start, uint32_t want)
+{
+	uint32_t end = start + want;
+	struct range_span span;
+
+	if (!rs->cache_buf || want == 0)
+		return 0;
+	if (rs->scoreboard_count == 0)
+		return 0;
+	if (start < rs->cache_base)
+		return 0;
+	if (end > rs->cache_base + rs->cache_cap)
+		end = rs->cache_base + rs->cache_cap;
+	if (start >= end)
+		return 0;
+	span = rs->scoreboard[0];
+	if (span.start > start)
+		return 0;
+	if (span.end <= start)
+		return 0;
+	if (span.end < end)
+		return span.end - start;
+	return end - start;
+}
+
+static uint32_t read_state_copy_from_cache(struct read_state *rs,
+					   uint32_t start, uint32_t want,
+					   uint8_t *dst)
+{
+	uint32_t covered = read_state_cached_prefix_len(rs, start, want);
+
+	if (!covered)
+		return 0;
+	memcpy(dst,
+	       rs->cache_buf + (start - rs->cache_base),
+	       covered);
+	return covered;
+}
+
+static int read_state_prepare_window(struct read_state *rs,
+				     uint32_t start, uint32_t len,
+				     uint8_t **dst_out)
+{
+	if (!dst_out)
+		return -EINVAL;
+	if (len == 0)
+		return 0;
+
+	if (len > HELPER_READ_CACHE_MAX)
+		len = HELPER_READ_CACHE_MAX;
+
+	if (!rs->cache_buf || rs->cache_cap < len) {
+		uint8_t *tmp = realloc(rs->cache_buf, len);
+		if (!tmp)
+			return -ENOMEM;
+		rs->cache_buf = tmp;
+		rs->cache_cap = len;
+	}
+
+	rs->cache_base = start;
+	rs->scoreboard_count = 0;
+	memset(rs->scoreboard, 0, sizeof(rs->scoreboard));
+	*dst_out = rs->cache_buf;
+	return 0;
+}
+
+static void read_state_commit_window(struct read_state *rs,
+				     uint32_t start, uint32_t len)
+{
+	rs->cache_base = start;
+	rs->scoreboard_count = 0;
+	memset(rs->scoreboard, 0, sizeof(rs->scoreboard));
+	read_state_add_coverage(rs, start, start + len);
+}
 
 static volatile sig_atomic_t g_stop;
 static int g_verbose;
@@ -279,7 +930,11 @@ static int write_full(int fd, const void *buf, size_t len)
 	const uint8_t *p = buf;
 
 	while (len) {
-		ssize_t n = write(fd, p, len);
+		ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+		if (n < 0 && (errno == ENOTSOCK || errno == EOPNOTSUPP || errno == EINVAL))
+			n = write(fd, p, len);
+		if (n == 0)
+			return -EPIPE;
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
@@ -296,6 +951,9 @@ static int master_send_packet(int fd, uint32_t type, const void *data, uint32_t 
 	uint8_t hdr[8];
 	int ret;
 
+	if (len && !data)
+		return -EINVAL;
+
 	put32be(hdr, type);
 	put32be(hdr + 4, len);
 	ret = write_full(fd, hdr, sizeof(hdr));
@@ -310,6 +968,12 @@ static int master_recv_packet(int fd, uint32_t *type, uint8_t **data, uint32_t *
 {
 	uint8_t hdr[8];
 	int ret;
+
+	if (!type || !data || !len)
+		return -EINVAL;
+	*type = 0;
+	*len = 0;
+	*data = NULL;
 
 	ret = read_full(fd, hdr, sizeof(hdr));
 	if (ret)
@@ -336,29 +1000,631 @@ static int master_recv_packet(int fd, uint32_t *type, uint8_t **data, uint32_t *
 	return 0;
 }
 
-static int master_rpc(struct helper_session *s,
-		      uint32_t req_type, const uint8_t *req_data, uint32_t req_len,
-		      uint32_t rsp_type, uint8_t **rsp_data, uint32_t *rsp_len)
+static bool req_has_msgid(uint32_t req_type, uint32_t req_len)
 {
-	uint32_t got_type;
+	if (req_len < 4)
+		return false;
+	if (req_type == CLTOMA_FUSE_REGISTER)
+		return false;
+	return true;
+}
+
+static bool packet_is_unsolicited(uint32_t type, const uint8_t *data, uint32_t len)
+{
+	/* Master keep-alive packet: ANTOAN_NOP + msgid(0) */
+	if (type == ANTOAN_NOP && len == 4)
+		return true;
+	/* Unsolicited notifications/events from master are sent with msgid 0. */
+	if (len >= 4 && get32be(data) == 0)
+		return true;
+	return false;
+}
+
+static bool master_conn_broken(int ret)
+{
+	return ret == -EPIPE || ret == -ECONNRESET || ret == -ENOTCONN;
+}
+
+static void session_reset_state(struct helper_session *s)
+{
+	if (s->master_fd >= 0) {
+		close(s->master_fd);
+		s->master_fd = -1;
+	}
+	s->active = false;
+	s->next_msgid = 1;
+	s->session_id = 0;
+	s->master_version = 0;
+	s->attr_size = 36;
+	s->master_host[0] = '\0';
+	s->master_port = 0;
+	s->subdir[0] = '\0';
+	s->master_last_nop = time(NULL);
+	if (s->read_cs_fd >= 0) {
+		close(s->read_cs_fd);
+		s->read_cs_fd = -1;
+	}
+	s->read_meta_valid = false;
+	s->read_meta_status = 0;
+	s->read_inode = 0;
+	s->read_chunk_idx = 0;
+	memset(&s->read_meta, 0, sizeof(s->read_meta));
+	s->read_cs_ip = 0;
+	s->read_cs_port = 0;
+	session_reset_read_scoreboard(s);
+	session_reset_read_prefetch(s);
+	session_reset_read_meta_cache(s);
+	if (s->write_cs_fd >= 0) {
+		close(s->write_cs_fd);
+		s->write_cs_fd = -1;
+	}
+	s->write_cs_active = false;
+	s->write_next_writeid = 1;
+	s->write_meta_valid = false;
+	s->write_inode = 0;
+	s->write_chunk_idx = 0;
+	memset(&s->write_meta, 0, sizeof(s->write_meta));
+	s->write_file_size = 0;
+	s->write_min_chunk_off = 0;
+	s->write_max_chunk_end = 0;
+	s->write_cs_ip = 0;
+	s->write_cs_port = 0;
+}
+
+static void session_clear_master_slot(struct helper_session *s)
+{
+	free(s->master_req_data);
+	s->master_req_data = NULL;
+	s->master_req_len = 0;
+	free(s->master_rsp_data);
+	s->master_rsp_data = NULL;
+	s->master_rsp_len = 0;
+	s->master_rsp_status = 0;
+	s->master_req_pending = false;
+	s->master_req_done = false;
+}
+
+static int build_register_packet(const char *subdir, uint8_t **pkt_out,
+				 uint32_t *pkt_len_out)
+{
+	uint8_t *pkt;
+	uint32_t pkt_len;
+	uint32_t info_len = (uint32_t)strlen(HELPER_INFO_STR) + 1;
+	uint32_t sub_len = (subdir && subdir[0]) ? (uint32_t)strlen(subdir) + 1 : 2;
+	size_t off;
+
+	if (!pkt_out || !pkt_len_out)
+		return -EINVAL;
+
+	pkt_len = 64 + 1 + 4 + 4 + info_len + 4 + sub_len;
+	pkt = calloc(1, pkt_len);
+	if (!pkt)
+		return -ENOMEM;
+
+	off = 0;
+	memcpy(pkt + off, FUSE_REGISTER_BLOB_ACL, 64);
+	off += 64;
+	pkt[off++] = REGISTER_NEWSESSION;
+	put16be(pkt + off, MFS_VERSMAJ);
+	off += 2;
+	pkt[off++] = MFS_VERSMID;
+	pkt[off++] = MFS_VERSMIN;
+	put32be(pkt + off, info_len);
+	off += 4;
+	memcpy(pkt + off, HELPER_INFO_STR, info_len);
+	off += info_len;
+	put32be(pkt + off, sub_len);
+	off += 4;
+	if (subdir && subdir[0]) {
+		size_t subdir_len = strlen(subdir);
+		memcpy(pkt + off, subdir, subdir_len);
+		pkt[off + subdir_len] = '\0';
+	} else {
+		pkt[off] = '/';
+	}
+
+	*pkt_out = pkt;
+	*pkt_len_out = pkt_len;
+	return 0;
+}
+
+static int session_reregister(struct helper_session *s)
+{
+	uint8_t *pkt = NULL;
+	uint8_t *rsp = NULL;
+	uint32_t pkt_len = 0;
+	uint32_t rsp_len = 0;
+	uint32_t v1, v2;
+	int fd;
+	int ret;
+
+	if (!s->master_host[0] || s->master_port == 0)
+		return -EINVAL;
+
+	fd = connect_tcp(s->master_host, s->master_port, HELPER_MASTER_TIMEOUT_MS);
+	if (fd < 0)
+		return fd;
+
+	ret = build_register_packet(s->subdir, &pkt, &pkt_len);
+	if (ret) {
+		close(fd);
+		return ret;
+	}
+
+	ret = master_send_packet(fd, CLTOMA_FUSE_REGISTER, pkt, pkt_len);
+	free(pkt);
+	if (ret) {
+		close(fd);
+		return ret;
+	}
+	ret = master_recv_packet(fd, &v1, &rsp, &rsp_len);
+	if (ret) {
+		close(fd);
+		return ret;
+	}
+	if (v1 != MATOCL_FUSE_REGISTER) {
+		free(rsp);
+		close(fd);
+		return -EPROTO;
+	}
+	if (rsp_len == 1) {
+		ret = rsp[0];
+		free(rsp);
+		close(fd);
+		return ret;
+	}
+	if (rsp_len < 8) {
+		free(rsp);
+		close(fd);
+		return -EPROTO;
+	}
+
+	v1 = get32be(rsp);
+	v2 = get32be(rsp + 4);
+	if (v1 >= 0x00010000 && v1 <= 0x0fffffff) {
+		s->master_version = v1;
+		s->session_id = v2;
+	} else {
+		s->master_version = 0;
+		s->session_id = v1;
+	}
+	free(rsp);
+
+	if (s->master_fd >= 0)
+		close(s->master_fd);
+	s->master_fd = fd;
+	s->next_msgid = 1;
+	s->active = true;
+	vlog("master reconnect: new session=%u master_version=0x%08x",
+	     s->session_id, s->master_version);
+	return 0;
+}
+
+static int master_idle_pump(struct helper_session *s)
+{
+	struct pollfd pfd;
+	uint32_t got_type = 0;
+	uint8_t *pkt = NULL;
+	uint32_t pkt_len = 0;
+	time_t now = time(NULL);
 	int ret;
 
 	if (s->master_fd < 0)
 		return -ENOTCONN;
 
-	ret = master_send_packet(s->master_fd, req_type, req_data, req_len);
-	if (ret)
-		return ret;
-
-	ret = master_recv_packet(s->master_fd, &got_type, rsp_data, rsp_len);
-	if (ret)
-		return ret;
-	if (got_type != rsp_type) {
-		free(*rsp_data);
-		*rsp_data = NULL;
-		return -EPROTO;
+	if (now - s->master_last_nop >= 2) {
+		ret = master_send_packet(s->master_fd, ANTOAN_NOP, NULL, 0);
+		if (ret)
+			return ret;
+		s->master_last_nop = now;
 	}
+
+	pfd.fd = s->master_fd;
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+	ret = poll(&pfd, 1, 250);
+	if (ret <= 0)
+		return ret;
+	if (!(pfd.revents & (POLLIN | POLLERR | POLLHUP)))
+		return 0;
+	if (pfd.revents & (POLLERR | POLLHUP))
+		return -ECONNRESET;
+
+	ret = master_recv_packet(s->master_fd, &got_type, &pkt, &pkt_len);
+	if (ret)
+		return ret;
+	if (packet_is_unsolicited(got_type, pkt, pkt_len)) {
+		vlog("master idle: skipped unsolicited packet type=0x%08x len=%u",
+		     got_type, pkt_len);
+		free(pkt);
+		return 0;
+	}
+	vlog("master idle: unexpected packet type=0x%08x len=%u",
+	     got_type, pkt_len);
+	free(pkt);
+	return -EPROTO;
+}
+
+static int master_rpc_once(struct helper_session *s,
+			   uint32_t req_type, const uint8_t *req_data, uint32_t req_len,
+			   uint32_t rsp_type, uint8_t **rsp_data, uint32_t *rsp_len)
+{
+	uint8_t *pkt = NULL;
+	uint32_t pkt_len = 0;
+	uint32_t got_type;
+	uint32_t req_msgid = 0;
+	bool expect_msgid;
+	unsigned int skipped = 0;
+	int ret;
+
+	if (s->master_fd < 0)
+		return -ENOTCONN;
+	if (!rsp_data || !rsp_len)
+		return -EINVAL;
+	*rsp_data = NULL;
+	*rsp_len = 0;
+
+	ret = master_send_packet(s->master_fd, req_type, req_data, req_len);
+	if (ret) {
+		vlog("master_rpc: send failed req=0x%08x rsp=0x%08x ret=%d",
+		     req_type, rsp_type, ret);
+		return ret;
+	}
+
+	expect_msgid = req_has_msgid(req_type, req_len);
+	if (expect_msgid)
+		req_msgid = get32be(req_data);
+
+	for (;;) {
+		ret = master_recv_packet(s->master_fd, &got_type, &pkt, &pkt_len);
+		if (ret) {
+			vlog("master_rpc: recv failed req=0x%08x rsp=0x%08x ret=%d",
+			     req_type, rsp_type, ret);
+			return ret;
+		}
+		if (got_type != rsp_type) {
+			if (packet_is_unsolicited(got_type, pkt, pkt_len)) {
+				vlog("master_rpc: skipped unsolicited packet type=0x%08x len=%u",
+				     got_type, pkt_len);
+				free(pkt);
+				pkt = NULL;
+				if (++skipped > HELPER_MASTER_MAX_SKIPPED_PKTS)
+					return -EPROTO;
+				continue;
+			}
+			vlog("master_rpc: type mismatch got=0x%08x expected=0x%08x rsp_len=%u",
+			     got_type, rsp_type, pkt_len);
+			free(pkt);
+			return -EPROTO;
+		}
+		if (expect_msgid) {
+			uint32_t got_msgid;
+			if (pkt_len < 4) {
+				free(pkt);
+				return -EPROTO;
+			}
+			got_msgid = get32be(pkt);
+			if (got_msgid != req_msgid) {
+				vlog("master_rpc: skipped stale response type=0x%08x msgid=%u expected=%u len=%u",
+				     got_type, got_msgid, req_msgid, pkt_len);
+				free(pkt);
+				pkt = NULL;
+				if (++skipped > HELPER_MASTER_MAX_SKIPPED_PKTS)
+					return -EPROTO;
+				continue;
+			}
+		}
+		*rsp_data = pkt;
+		*rsp_len = pkt_len;
+		return 0;
+	}
+}
+
+static void *master_thread_main(void *arg)
+{
+	struct helper_session *s = arg;
+
+	for (;;) {
+		bool have_req = false;
+		uint32_t req_type = 0;
+		uint32_t rsp_type = 0;
+		uint32_t req_len = 0;
+		uint8_t *req_data = NULL;
+		int ret;
+		uint8_t *rsp_data = NULL;
+		uint32_t rsp_len = 0;
+
+		pthread_mutex_lock(&s->master_mu);
+		while (!s->master_thread_stop && !s->master_req_pending) {
+			struct timespec ts;
+
+			clock_gettime(CLOCK_REALTIME, &ts);
+			ts.tv_nsec += 250 * 1000 * 1000;
+			if (ts.tv_nsec >= 1000000000L) {
+				ts.tv_sec += 1;
+				ts.tv_nsec -= 1000000000L;
+			}
+			pthread_cond_timedwait(&s->master_cv, &s->master_mu, &ts);
+			if (!s->master_req_pending)
+				break;
+		}
+		if (s->master_thread_stop) {
+			pthread_mutex_unlock(&s->master_mu);
+			break;
+		}
+		if (s->master_req_pending) {
+			have_req = true;
+			req_type = s->master_req_type;
+			rsp_type = s->master_rsp_type;
+			req_len = s->master_req_len;
+			req_data = s->master_req_data;
+		}
+		pthread_mutex_unlock(&s->master_mu);
+
+		if (!have_req) {
+			ret = master_idle_pump(s);
+			if (ret < 0 && master_conn_broken(ret)) {
+				vlog("master idle: connection broken ret=%d, attempting re-register", ret);
+				(void)session_reregister(s);
+			}
+			continue;
+		}
+
+		ret = master_rpc_once(s, req_type, req_data, req_len, rsp_type,
+				      &rsp_data, &rsp_len);
+		if (master_conn_broken(ret)) {
+			vlog("master thread: connection broken ret=%d, attempting re-register", ret);
+			ret = session_reregister(s);
+			if (!ret) {
+				ret = master_rpc_once(s, req_type, req_data, req_len,
+						      rsp_type, &rsp_data, &rsp_len);
+			}
+		}
+
+		pthread_mutex_lock(&s->master_mu);
+		s->master_rsp_status = ret;
+		s->master_rsp_data = rsp_data;
+		s->master_rsp_len = rsp_len;
+		s->master_req_pending = false;
+		s->master_req_done = true;
+		pthread_cond_broadcast(&s->master_cv);
+		pthread_mutex_unlock(&s->master_mu);
+	}
+
+	return NULL;
+}
+
+static int session_start_master_thread(struct helper_session *s)
+{
+	int ret;
+
+	pthread_mutex_lock(&s->master_mu);
+	session_clear_master_slot(s);
+	s->master_thread_stop = false;
+	pthread_mutex_unlock(&s->master_mu);
+
+	ret = pthread_create(&s->master_thread, NULL, master_thread_main, s);
+	if (ret)
+		return -ret;
+	s->master_thread_running = true;
 	return 0;
+}
+
+static void session_stop_master_thread(struct helper_session *s)
+{
+	if (!s->master_thread_running)
+		return;
+
+	pthread_mutex_lock(&s->master_mu);
+	s->master_thread_stop = true;
+	pthread_cond_broadcast(&s->master_cv);
+	pthread_mutex_unlock(&s->master_mu);
+
+	pthread_join(s->master_thread, NULL);
+	s->master_thread_running = false;
+
+	pthread_mutex_lock(&s->master_mu);
+	session_clear_master_slot(s);
+	pthread_mutex_unlock(&s->master_mu);
+}
+
+static int master_rpc(struct helper_session *s,
+		      uint32_t req_type, const uint8_t *req_data, uint32_t req_len,
+		      uint32_t rsp_type, uint8_t **rsp_data, uint32_t *rsp_len)
+{
+	uint8_t *req_copy = NULL;
+	int ret;
+
+	if (!rsp_data || !rsp_len)
+		return -EINVAL;
+	*rsp_data = NULL;
+	*rsp_len = 0;
+
+	if (!s->master_thread_running)
+		return master_rpc_once(s, req_type, req_data, req_len, rsp_type,
+				       rsp_data, rsp_len);
+
+	if (req_len) {
+		req_copy = malloc(req_len);
+		if (!req_copy)
+			return -ENOMEM;
+		memcpy(req_copy, req_data, req_len);
+	}
+
+	pthread_mutex_lock(&s->master_mu);
+	while (s->master_req_pending)
+		pthread_cond_wait(&s->master_cv, &s->master_mu);
+
+	session_clear_master_slot(s);
+	s->master_req_type = req_type;
+	s->master_req_data = req_copy;
+	s->master_req_len = req_len;
+	s->master_rsp_type = rsp_type;
+	s->master_req_pending = true;
+	s->master_req_done = false;
+	pthread_cond_broadcast(&s->master_cv);
+
+	while (!s->master_req_done)
+		pthread_cond_wait(&s->master_cv, &s->master_mu);
+
+	ret = s->master_rsp_status;
+	*rsp_data = s->master_rsp_data;
+	*rsp_len = s->master_rsp_len;
+	s->master_rsp_data = NULL;
+	s->master_rsp_len = 0;
+	free(s->master_req_data);
+	s->master_req_data = NULL;
+	s->master_req_len = 0;
+	s->master_req_done = false;
+	pthread_cond_broadcast(&s->master_cv);
+	pthread_mutex_unlock(&s->master_mu);
+
+	return ret;
+}
+
+static void *read_prefetch_thread_main(void *arg)
+{
+	struct helper_session *s = arg;
+
+	for (;;) {
+		struct read_prefetch_request work = {0};
+		struct chunk_meta meta;
+		int ret;
+		size_t i;
+
+		pthread_mutex_lock(&s->read_prefetch_mu);
+		for (;;) {
+			if (s->read_prefetch_thread_stop)
+				break;
+			for (i = 0; i < HELPER_READ_PREFETCH_QUEUE_MAX; i++) {
+				if (s->read_prefetch_queue[i].valid) {
+					work = s->read_prefetch_queue[i];
+					s->read_prefetch_queue[i].valid = false;
+					break;
+				}
+			}
+			if (work.valid || s->read_prefetch_thread_stop)
+				break;
+			pthread_cond_wait(&s->read_prefetch_cv, &s->read_prefetch_mu);
+		}
+		if (s->read_prefetch_thread_stop) {
+			pthread_mutex_unlock(&s->read_prefetch_mu);
+			break;
+		}
+		pthread_mutex_unlock(&s->read_prefetch_mu);
+
+		if (!session_lookup_read_meta_cache(s, work.inode, work.chunk_idx, &meta, &ret)) {
+			ret = session_read_chunk_meta(s, work.inode, work.chunk_idx, &meta);
+			if (ret == MFS_ERROR_NOCHUNKSERVERS || ret == MFS_ERROR_NOCHUNK) {
+				session_store_read_meta_cache(s, work.inode, work.chunk_idx, ret, NULL);
+				continue;
+			}
+			if (ret)
+				continue;
+			session_store_read_meta_cache(s, work.inode, work.chunk_idx, 0, &meta);
+		} else if (ret) {
+			continue;
+		}
+
+		if (work.fetch_len > 0 && meta.loc_count > 0) {
+			uint8_t *buf = malloc(work.fetch_len);
+			uint32_t got = 0;
+			struct read_prefetch_data_entry *victim = NULL;
+
+			if (!buf)
+				continue;
+			pthread_mutex_lock(&s->read_prefetch_mu);
+			while (!s->read_prefetch_thread_stop &&
+			       s->read_foreground_inflight > 0)
+				pthread_cond_wait(&s->read_prefetch_cv, &s->read_prefetch_mu);
+			pthread_mutex_unlock(&s->read_prefetch_mu);
+			if (s->read_prefetch_thread_stop) {
+				free(buf);
+				break;
+			}
+			ret = cs_read_data(&meta, work.chunk_off, work.fetch_len, buf, &got);
+			if (!ret && got > 0) {
+				pthread_mutex_lock(&s->read_prefetch_mu);
+				for (i = 0; i < HELPER_READ_PREFETCH_DATA_CACHE_MAX; i++) {
+					struct read_prefetch_data_entry *ent = &s->read_prefetch_data[i];
+
+					if (ent->valid &&
+					    ent->inode == work.inode &&
+					    ent->chunk_idx == work.chunk_idx &&
+					    ent->base == work.chunk_off) {
+						victim = ent;
+						break;
+					}
+					if (!victim || !victim->valid || ent->stamp < victim->stamp)
+						victim = ent;
+				}
+				if (victim) {
+					if (victim->cap < got) {
+						uint8_t *tmp = realloc(victim->buf, got);
+						if (tmp) {
+							victim->buf = tmp;
+							victim->cap = got;
+						}
+					}
+					if (victim->cap >= got) {
+						memcpy(victim->buf, buf, got);
+						victim->valid = true;
+						victim->inode = work.inode;
+						victim->chunk_idx = work.chunk_idx;
+						victim->base = work.chunk_off;
+						victim->len = got;
+						victim->stamp = ++s->read_prefetch_data_clock;
+					}
+				}
+				pthread_mutex_unlock(&s->read_prefetch_mu);
+			}
+			free(buf);
+		}
+	}
+
+	return NULL;
+}
+
+static int session_start_read_prefetch_thread(struct helper_session *s)
+{
+	size_t i;
+
+	pthread_mutex_lock(&s->read_prefetch_mu);
+	s->read_prefetch_thread_stop = false;
+	memset(s->read_prefetch_queue, 0, sizeof(s->read_prefetch_queue));
+	pthread_mutex_unlock(&s->read_prefetch_mu);
+
+	for (i = 0; i < HELPER_READ_PREFETCH_WORKERS; i++) {
+		int ret = pthread_create(&s->read_prefetch_threads[i], NULL,
+					 read_prefetch_thread_main, s);
+		if (ret) {
+			pthread_mutex_lock(&s->read_prefetch_mu);
+			s->read_prefetch_thread_stop = true;
+			pthread_cond_broadcast(&s->read_prefetch_cv);
+			pthread_mutex_unlock(&s->read_prefetch_mu);
+			while (i-- > 0)
+				pthread_join(s->read_prefetch_threads[i], NULL);
+			return -ret;
+		}
+	}
+	s->read_prefetch_thread_running = true;
+	return 0;
+}
+
+static void session_stop_read_prefetch_thread(struct helper_session *s)
+{
+	if (!s->read_prefetch_thread_running)
+		return;
+
+	pthread_mutex_lock(&s->read_prefetch_mu);
+	s->read_prefetch_thread_stop = true;
+	memset(s->read_prefetch_queue, 0, sizeof(s->read_prefetch_queue));
+	pthread_cond_broadcast(&s->read_prefetch_cv);
+	pthread_mutex_unlock(&s->read_prefetch_mu);
+
+	for (size_t i = 0; i < HELPER_READ_PREFETCH_WORKERS; i++)
+		pthread_join(s->read_prefetch_threads[i], NULL);
+	s->read_prefetch_thread_running = false;
 }
 
 static uint32_t next_msgid(struct helper_session *s)
@@ -399,6 +1665,9 @@ static int session_getattr(struct helper_session *s, uint32_t inode,
 	uint8_t status;
 	int ret;
 
+	vlog("getattr: inode=%u uid=%u gid=%u msgid=%u session=%u",
+	     inode, uid, gid, msgid, s->session_id);
+
 	put32be(req, msgid);
 	put32be(req + 4, inode);
 	req[8] = 0;
@@ -407,28 +1676,61 @@ static int session_getattr(struct helper_session *s, uint32_t inode,
 
 	ret = master_rpc(s, CLTOMA_FUSE_GETATTR, req, sizeof(req),
 			 MATOCL_FUSE_GETATTR, &rsp, &rsp_len);
-	if (ret)
+	if (ret) {
+		vlog("getattr: master_rpc failed ret=%d", ret);
 		return ret;
+	}
+
+	vlog("getattr: rsp_len=%u", rsp_len);
 
 	if (rsp_len == 5) {
 		ret = parse_simple_status(msgid, rsp, rsp_len, &status);
 		free(rsp);
-		if (ret)
+		if (ret) {
+			vlog("getattr: parse_simple_status failed ret=%d", ret);
 			return ret;
+		}
+		vlog("getattr: master returned status=%u (MFS error)", (unsigned)status);
 		return status;
 	}
 
 	ret = parse_msgid(msgid, rsp, rsp_len);
 	if (ret) {
 		free(rsp);
+		vlog("getattr: parse_msgid failed ret=%d", ret);
 		return ret;
 	}
 
 	ret = parse_attr_record(rsp + 4, rsp_len - 4, out, NULL);
 	if (!ret)
 		s->attr_size = (rsp_len - 4 >= 36) ? 36 : 35;
+	vlog("getattr: parse_attr_record ret=%d rsp_len=%u attr_size=%d",
+	     ret, rsp_len, s->attr_size);
 	free(rsp);
 	return ret;
+}
+
+static int session_get_register_random(struct helper_session *s, uint8_t rnd[32])
+{
+	uint8_t pkt[64 + 1];
+	uint8_t *rsp = NULL;
+	uint32_t rsp_len = 0;
+	int ret;
+
+	memcpy(pkt, FUSE_REGISTER_BLOB_ACL, 64);
+	pkt[64] = REGISTER_GETRANDOM;
+
+	ret = master_rpc_once(s, CLTOMA_FUSE_REGISTER, pkt, sizeof(pkt),
+			      MATOCL_FUSE_REGISTER, &rsp, &rsp_len);
+	if (ret)
+		return ret;
+	if (rsp_len != 32) {
+		free(rsp);
+		return -EPROTO;
+	}
+	memcpy(rnd, rsp, 32);
+	free(rsp);
+	return 0;
 }
 
 static int session_register(struct helper_session *s,
@@ -440,55 +1742,108 @@ static int session_register(struct helper_session *s,
 	uint32_t pkt_len;
 	uint8_t *rsp = NULL;
 	uint32_t rsp_len = 0;
+	uint8_t rnd[32];
+	uint8_t digest[16];
+	uint8_t passdigest[16];
 	uint32_t v1, v2;
 	int fd;
 	int ret;
 	size_t off;
-	uint32_t msgid;
+	const uint8_t *password = NULL;
+	md5ctx ctx;
 
 	if (tail_len < (uint32_t)req->master_len + req->subdir_len + req->password_len)
 		return -EINVAL;
 
-	memset(s, 0, sizeof(*s));
-	s->master_fd = -1;
-	s->attr_size = 36;
-	s->next_msgid = 1;
+	session_stop_master_thread(s);
+	session_reset_state(s);
 	memcpy(s->master_host, tail, req->master_len);
 	s->master_host[req->master_len] = '\0';
 	off = req->master_len;
 	memcpy(s->subdir, tail + off, req->subdir_len);
 	s->subdir[req->subdir_len] = '\0';
+	password = tail + off + req->subdir_len;
 	s->master_port = req->master_port ? req->master_port : MFS_DEFAULT_MASTER_PORT;
 
+	fprintf(stderr, "register: master_host='%s' master_port=%u master_len=%u subdir='%s' subdir_len=%u password_len=%u tail_len=%u\n",
+	     s->master_host, (unsigned)s->master_port,
+	     (unsigned)req->master_len, s->subdir,
+	     (unsigned)req->subdir_len, (unsigned)req->password_len,
+	     (unsigned)tail_len);
+
 	fd = connect_tcp(s->master_host, s->master_port, HELPER_MASTER_TIMEOUT_MS);
-	if (fd < 0)
+	if (fd < 0) {
+		fprintf(stderr, "register: connect_tcp failed ret=%d host='%s' port=%u\n",
+		     fd, s->master_host, (unsigned)s->master_port);
 		return fd;
+	}
 	s->master_fd = fd;
 
-	pkt_len = 64 + 1 + 4 + 4 + (uint32_t)strlen(HELPER_INFO_STR) + 4 + req->subdir_len;
-	pkt = calloc(1, pkt_len);
-	if (!pkt) {
-		close(fd);
-		s->master_fd = -1;
-		return -ENOMEM;
-	}
-	off = 0;
-	memcpy(pkt + off, FUSE_REGISTER_BLOB_NOACL, 64);
-	off += 64;
-	pkt[off++] = REGISTER_NEWSESSION;
-	put32be(pkt + off, VERSION_ANY);
-	off += 4;
-	put32be(pkt + off, (uint32_t)strlen(HELPER_INFO_STR));
-	off += 4;
-	memcpy(pkt + off, HELPER_INFO_STR, strlen(HELPER_INFO_STR));
-	off += strlen(HELPER_INFO_STR);
-	put32be(pkt + off, req->subdir_len);
-	off += 4;
-	if (req->subdir_len)
-		memcpy(pkt + off, s->subdir, req->subdir_len);
+	/*
+	 * MooseFS wire protocol: info and subdir string lengths INCLUDE
+	 * the null terminator (see mfsclient/mastercomm.c: strlen()+1).
+	 * The kernel module sends lengths WITHOUT null (strnlen), so we
+	 * add +1 here for each string when building the registration packet.
+	 */
+	{
+		uint32_t info_len = (uint32_t)strlen(HELPER_INFO_STR) + 1; /* +1 for NUL */
+		uint32_t sub_len = req->subdir_len ? req->subdir_len + 1 : 2; /* "/" + NUL */
 
-	ret = master_rpc(s, CLTOMA_FUSE_REGISTER, pkt, pkt_len,
-			 MATOCL_FUSE_REGISTER, &rsp, &rsp_len);
+		pkt_len = 64 + 1 + 4 + 4 + info_len + 4 + sub_len +
+			  (req->password_len ? 16U : 0U);
+		pkt = calloc(1, pkt_len);
+		if (!pkt) {
+			close(fd);
+			s->master_fd = -1;
+			return -ENOMEM;
+		}
+		off = 0;
+		memcpy(pkt + off, FUSE_REGISTER_BLOB_ACL, 64);
+		off += 64;
+		pkt[off++] = REGISTER_NEWSESSION;
+		/* Version: 2 bytes major, 1 byte mid, 1 byte minor (matches mfsmount) */
+		put16be(pkt + off, MFS_VERSMAJ);
+		off += 2;
+		pkt[off++] = MFS_VERSMID;
+		pkt[off++] = MFS_VERSMIN;
+		/* info string with null terminator */
+		put32be(pkt + off, info_len);
+		off += 4;
+		memcpy(pkt + off, HELPER_INFO_STR, info_len); /* includes NUL */
+		off += info_len;
+		/* subdir string with null terminator */
+		put32be(pkt + off, sub_len);
+		off += 4;
+		if (req->subdir_len) {
+			memcpy(pkt + off, s->subdir, req->subdir_len);
+			pkt[off + req->subdir_len] = '\0'; /* explicit NUL */
+		} else {
+			pkt[off] = '/';  /* default: root subdir */
+			/* calloc already zeroed the rest */
+		}
+		off += sub_len;
+		if (req->password_len) {
+			ret = session_get_register_random(s, rnd);
+			if (ret) {
+				free(pkt);
+				close(fd);
+				s->master_fd = -1;
+				return ret;
+			}
+			md5_init(&ctx);
+			md5_update(&ctx, password, req->password_len);
+			md5_final(passdigest, &ctx);
+			md5_init(&ctx);
+			md5_update(&ctx, rnd, 16);
+			md5_update(&ctx, passdigest, 16);
+			md5_update(&ctx, rnd + 16, 16);
+			md5_final(digest, &ctx);
+			memcpy(pkt + off, digest, 16);
+		}
+	}
+
+	ret = master_rpc_once(s, CLTOMA_FUSE_REGISTER, pkt, pkt_len,
+			      MATOCL_FUSE_REGISTER, &rsp, &rsp_len);
 	free(pkt);
 	if (ret)
 		goto fail;
@@ -506,11 +1861,19 @@ static int session_register(struct helper_session *s,
 
 	v1 = get32be(rsp);
 	v2 = get32be(rsp + 4);
-	if (v1 >= 0x00010000 && v1 <= 0x0fffffff)
+	if (v1 >= 0x00010000 && v1 <= 0x0fffffff) {
+		s->master_version = v1;
 		s->session_id = v2;
-	else
+	} else {
+		s->master_version = 0;
 		s->session_id = v1;
+	}
 	free(rsp);
+
+	s->active = true;
+	ret = session_start_master_thread(s);
+	if (ret)
+		goto fail;
 
 	ret = session_getattr(s, MFS_ROOT_ID, req->mount_uid, req->mount_gid,
 			      &out->root_attr);
@@ -520,11 +1883,13 @@ static int session_register(struct helper_session *s,
 	out->session_id = s->session_id;
 	out->root_inode = MFS_ROOT_ID;
 	s->active = true;
-	vlog("registered session=%u master=%s:%u", s->session_id,
-	     s->master_host, (unsigned)s->master_port);
+	vlog("registered session=%u master=%s:%u master_version=0x%08x",
+	     s->session_id, s->master_host, (unsigned)s->master_port,
+	     s->master_version);
 	return 0;
 
 fail:
+	session_stop_master_thread(s);
 	if (s->master_fd >= 0)
 		close(s->master_fd);
 	s->master_fd = -1;
@@ -593,12 +1958,13 @@ static int session_setattr(struct helper_session *s,
 			  const struct mfs_ctrl_setattr_req *req,
 			  struct mfs_wire_attr *out)
 {
-	uint8_t pkt[4 + 4 + 1 + 4 + 4 + 4 + 4 + 1 + 2 + 4 + 4 + 4 + 4 + 1 + 1];
+	uint8_t pkt[4 + 4 + 1 + 4 + 4 + 4 + 1 + 2 + 4 + 4 + 4 + 4 + 1 + 1];
 	uint8_t *rsp = NULL;
 	uint32_t rsp_len = 0;
 	uint32_t msgid = next_msgid(s);
 	uint8_t status;
 	uint8_t setmask = 0;
+	uint32_t pkt_len = 0;
 	uint32_t atime = (uint32_t)(req->atime_ns / 1000000000ULL);
 	uint32_t mtime = (uint32_t)(req->mtime_ns / 1000000000ULL);
 	int ret;
@@ -618,6 +1984,10 @@ static int session_setattr(struct helper_session *s,
 	else if (req->valid & MFS_SETATTR_MTIME)
 		setmask |= SET_MTIME_FLAG;
 
+	vlog("setattr: inode=%u valid=0x%x setmask=0x%x mode=%o uid=%u gid=%u atime=%u mtime=%u",
+	     req->inode, req->valid, setmask, req->mode & 07777,
+	     req->attr_uid, req->attr_gid, atime, mtime);
+
 	put32be(pkt, msgid);
 	put32be(pkt + 4, req->inode);
 	pkt[8] = 0;
@@ -633,7 +2003,23 @@ static int session_setattr(struct helper_session *s,
 	pkt[40] = 0;
 	pkt[41] = 0;
 
-	ret = master_rpc(s, CLTOMA_FUSE_SETATTR, pkt, sizeof(pkt),
+	if (s->master_version < VERSION2INT(1, 6, 25))
+		pkt_len = 35;
+	else if (s->master_version < VERSION2INT(1, 6, 28))
+		pkt_len = 36;
+	else if (s->master_version < VERSION2INT(2, 0, 0))
+		pkt_len = 37;
+	else if (s->master_version < VERSION2INT(3, 0, 93) ||
+		 s->master_version == VERSION2INT(4, 0, 0) ||
+		 s->master_version == VERSION2INT(4, 0, 1))
+		pkt_len = 41;
+	else
+		pkt_len = 42;
+
+	vlog("setattr: master_version=0x%08x pkt_len=%u",
+	     s->master_version, pkt_len);
+
+	ret = master_rpc(s, CLTOMA_FUSE_SETATTR, pkt, pkt_len,
 			 MATOCL_FUSE_SETATTR, &rsp, &rsp_len);
 	if (ret)
 		return ret;
@@ -916,6 +2302,10 @@ static int session_create(struct helper_session *s,
 	uint32_t rsp_len = 0;
 	int ret;
 
+	vlog("create: parent=%u name_len=%u mode=%o uid=%u gid=%u session=%u",
+	     req->parent_inode, req->name_len, req->mode & 07777,
+	     req->uid, req->gid, req->session_id);
+
 	if (!pkt)
 		return -ENOMEM;
 	put32be(pkt, msgid);
@@ -931,9 +2321,13 @@ static int session_create(struct helper_session *s,
 	ret = master_rpc(s, CLTOMA_FUSE_CREATE, pkt, pkt_len,
 			 MATOCL_FUSE_CREATE, &rsp, &rsp_len);
 	free(pkt);
-	if (ret)
+	if (ret) {
+		vlog("create: master_rpc failed ret=%d", ret);
 		return ret;
+	}
 	ret = parse_create_like(msgid, rsp, rsp_len, out);
+	vlog("create: parse_create_like ret=%d rsp_len=%u inode=%u",
+	     ret, rsp_len, out->inode);
 	free(rsp);
 	return ret;
 }
@@ -1319,26 +2713,17 @@ static int session_setxattr(struct helper_session *s,
 
 static int session_fsync(struct helper_session *s, const struct mfs_ctrl_fsync_req *req)
 {
-	uint8_t pkt[8];
-	uint8_t *rsp = NULL;
-	uint32_t rsp_len = 0;
-	uint32_t msgid = next_msgid(s);
-	uint8_t status;
 	int ret;
 
-	(void)req;
+	vlog("fsync: inode=%u datasync=%u session=%u",
+	     req->inode, req->datasync, req->session_id);
 
-	put32be(pkt, msgid);
-	put32be(pkt + 4, req->inode);
-	ret = master_rpc(s, CLTOMA_FUSE_FSYNC, pkt, sizeof(pkt),
-			 MATOCL_FUSE_FSYNC, &rsp, &rsp_len);
-	if (ret)
+	ret = session_finalize_active_write(s);
+	if (ret) {
+		vlog("fsync: finalize_active_write failed ret=%d", ret);
 		return ret;
-	ret = parse_simple_status(msgid, rsp, rsp_len, &status);
-	free(rsp);
-	if (ret)
-		return ret;
-	return status;
+	}
+	return MFS_STATUS_OK;
 }
 
 static int session_statfs(struct helper_session *s,
@@ -1465,49 +2850,256 @@ static int session_read_chunk_meta(struct helper_session *s,
 	return ret;
 }
 
+static void read_state_invalidate(struct read_state *rs)
+{
+	rs->meta_valid = false;
+	rs->meta_status = 0;
+	rs->inode = 0;
+	rs->chunk_idx = 0;
+	memset(&rs->meta, 0, sizeof(rs->meta));
+	if (rs->cs_fd >= 0) {
+		close(rs->cs_fd);
+		rs->cs_fd = -1;
+	}
+	rs->cs_ip = 0;
+	rs->cs_port = 0;
+	read_state_reset_scoreboard(rs);
+	read_state_reset_prefetch(rs);
+}
+
+static int read_state_get_chunk_meta(struct helper_session *s,
+				     struct read_state *rs,
+				     uint32_t inode, uint32_t chunk_idx,
+				     struct chunk_meta *m)
+{
+	int cached_status = 0;
+	int ret;
+
+	if (rs->meta_valid &&
+	    rs->inode == inode &&
+	    rs->chunk_idx == chunk_idx) {
+		if (rs->meta_status)
+			return rs->meta_status;
+		*m = rs->meta;
+		return 0;
+	}
+
+	if (session_lookup_read_meta_cache(s, inode, chunk_idx, m, &cached_status)) {
+		read_state_reset_scoreboard(rs);
+		rs->meta_valid = true;
+		rs->meta_status = cached_status;
+		rs->inode = inode;
+		rs->chunk_idx = chunk_idx;
+		if (cached_status) {
+			memset(&rs->meta, 0, sizeof(rs->meta));
+			return cached_status;
+		}
+		rs->meta = *m;
+		session_schedule_read_ahead(s, inode, chunk_idx + 1);
+		return 0;
+	}
+
+	read_state_reset_scoreboard(rs);
+	ret = session_read_chunk_meta(s, inode, chunk_idx, m);
+	if (ret) {
+		if (ret == MFS_ERROR_NOCHUNKSERVERS || ret == MFS_ERROR_NOCHUNK) {
+			session_store_read_meta_cache(s, inode, chunk_idx, ret, NULL);
+			rs->meta_valid = true;
+			rs->meta_status = ret;
+			rs->inode = inode;
+			rs->chunk_idx = chunk_idx;
+			memset(&rs->meta, 0, sizeof(rs->meta));
+		}
+		return ret;
+	}
+
+	rs->meta_valid = true;
+	rs->meta_status = 0;
+	rs->inode = inode;
+	rs->chunk_idx = chunk_idx;
+	rs->meta = *m;
+	session_store_read_meta_cache(s, inode, chunk_idx, 0, m);
+	session_schedule_read_ahead(s, inode, chunk_idx + 1);
+	return 0;
+}
+
 static int session_write_chunk_meta(struct helper_session *s,
 				    uint32_t inode, uint32_t chunk_idx,
+				    uint8_t extra_chunkopflags,
 				    struct chunk_meta *m)
 {
 	uint8_t pkt[4 + 4 + 4 + 1];
+	uint32_t pkt_len = 12;
 	uint8_t *rsp = NULL;
 	uint32_t rsp_len = 0;
 	uint32_t msgid = next_msgid(s);
+	uint8_t chunkopflags = CHUNKOPFLAG_CANMODTIME | extra_chunkopflags;
 	int ret;
 
 	put32be(pkt, msgid);
 	put32be(pkt + 4, inode);
 	put32be(pkt + 8, chunk_idx);
-	pkt[12] = 0;
+	if (s->master_version >= VERSION2INT(3, 0, 4)) {
+		pkt[12] = chunkopflags;
+		pkt_len = 13;
+	}
 
-	ret = master_rpc(s, CLTOMA_FUSE_WRITE_CHUNK, pkt, sizeof(pkt),
+	vlog("write_chunk_meta: inode=%u chunk=%u master_version=0x%08x pkt_len=%u flags=0x%x",
+	     inode, chunk_idx, s->master_version, pkt_len, chunkopflags);
+
+	ret = master_rpc(s, CLTOMA_FUSE_WRITE_CHUNK, pkt, pkt_len,
 			 MATOCL_FUSE_WRITE_CHUNK, &rsp, &rsp_len);
 	if (ret)
 		return ret;
 	ret = parse_chunk_meta_rsp(msgid, rsp, rsp_len, m);
+	if (!ret && m->loc_count > 0) {
+		vlog("write_chunk_meta: protocol=%u chunkid=%llu version=%u length=%llu loc_count=%u first_ip=0x%08x first_port=%u",
+		     m->protocol, (unsigned long long)m->chunkid, m->version,
+		     (unsigned long long)m->length, m->loc_count,
+		     m->locs[0].ip, m->locs[0].port);
+	}
 	free(rsp);
 	return ret;
 }
 
+static void session_invalidate_write_meta(struct helper_session *s)
+{
+	s->write_meta_valid = false;
+	s->write_inode = 0;
+	s->write_chunk_idx = 0;
+	memset(&s->write_meta, 0, sizeof(s->write_meta));
+	s->write_file_size = 0;
+	s->write_min_chunk_off = 0;
+	s->write_max_chunk_end = 0;
+	s->write_cs_active = false;
+	s->write_next_writeid = 1;
+}
+
+static int cs_write_finish_on_fd(int fd, const struct chunk_meta *m)
+{
+	uint8_t fin[12];
+	int ret;
+
+	put64be(fin, m->chunkid);
+	put32be(fin + 8, m->version);
+	ret = cs_send_packet(fd, CLTOCS_WRITE_FINISH, fin, sizeof(fin));
+	if (ret) {
+		vlog("cs_write_data: finish send failed chunkid=%llu ret=%d",
+		     (unsigned long long)m->chunkid, ret);
+		return ret;
+	}
+	vlog("cs_write_data: finish send ok chunkid=%llu",
+	     (unsigned long long)m->chunkid);
+	return 0;
+}
+
+static int session_finalize_active_write(struct helper_session *s)
+{
+	int ret;
+
+	if (!s->write_meta_valid)
+		return 0;
+
+	ret = session_write_chunk_end(s,
+				      s->write_inode,
+				      s->write_chunk_idx,
+				      s->write_meta.chunkid,
+				      s->write_file_size,
+				      s->write_min_chunk_off,
+				      s->write_max_chunk_end - s->write_min_chunk_off);
+	if (ret) {
+		vlog("write_finalize: inode=%u chunk=%u chunkid=%llu ret=%d",
+		     s->write_inode, s->write_chunk_idx,
+		     (unsigned long long)s->write_meta.chunkid, ret);
+		if (s->write_cs_fd >= 0) {
+			close(s->write_cs_fd);
+			s->write_cs_fd = -1;
+		}
+	}
+	session_invalidate_write_meta(s);
+	return ret;
+}
+
+static int session_get_write_chunk_meta(struct helper_session *s,
+					uint32_t inode, uint32_t chunk_idx,
+					struct chunk_meta *m)
+{
+	int ret;
+
+	if (s->write_meta_valid &&
+	    s->write_inode == inode &&
+	    s->write_chunk_idx == chunk_idx) {
+		*m = s->write_meta;
+		vlog("write_chunk_meta: cache hit inode=%u chunk=%u chunkid=%llu version=%u",
+		     inode, chunk_idx,
+		     (unsigned long long)m->chunkid, m->version);
+		return 0;
+	}
+
+	if (s->write_meta_valid) {
+		ret = session_finalize_active_write(s);
+		if (ret)
+			return ret;
+	}
+
+	ret = session_write_chunk_meta(s, inode, chunk_idx, 0, m);
+	if (ret)
+		return ret;
+
+	s->write_meta_valid = true;
+	s->write_inode = inode;
+	s->write_chunk_idx = chunk_idx;
+	s->write_meta = *m;
+	s->write_file_size = m->length;
+	s->write_min_chunk_off = UINT32_MAX;
+	s->write_max_chunk_end = 0;
+	return 0;
+}
+
 static int session_write_chunk_end(struct helper_session *s,
 			   uint32_t inode, uint32_t chunk_idx,
-			   uint64_t chunkid, uint64_t file_size)
+			   uint64_t chunkid, uint64_t file_size,
+			   uint32_t chunk_off, uint32_t write_size)
 {
-	uint8_t pkt[4 + 8 + 4 + 4 + 8 + 1];
+	uint8_t pkt[4 + 8 + 4 + 4 + 8 + 1 + 4 + 4];
 	uint8_t *rsp = NULL;
 	uint32_t rsp_len = 0;
 	uint32_t msgid = next_msgid(s);
+	uint32_t pkt_len;
+	uint8_t chunkopflags = 0;
 	uint8_t status;
 	int ret;
+	uint8_t *p = pkt;
 
-	put32be(pkt, msgid);
-	put64be(pkt + 4, chunkid);
-	put32be(pkt + 12, inode);
-	put32be(pkt + 16, chunk_idx);
-	put64be(pkt + 20, file_size);
-	pkt[28] = 0;
+	put32be(p, msgid);
+	p += 4;
+	put64be(p, chunkid);
+	p += 8;
+	put32be(p, inode);
+	p += 4;
+	if (s->master_version >= VERSION2INT(3, 0, 74)) {
+		put32be(p, chunk_idx);
+		p += 4;
+	}
+	put64be(p, file_size);
+	p += 8;
+	if (s->master_version >= VERSION2INT(3, 0, 4)) {
+		*p++ = chunkopflags;
+	}
+	if (s->master_version >= VERSION2INT(4, 40, 0)) {
+		put32be(p, chunk_off);
+		p += 4;
+		put32be(p, write_size);
+		p += 4;
+	}
+	pkt_len = (uint32_t)(p - pkt);
 
-	ret = master_rpc(s, CLTOMA_FUSE_WRITE_CHUNK_END, pkt, sizeof(pkt),
+	vlog("write_chunk_end: inode=%u chunk=%u chunkid=%llu file_size=%llu chunk_off=%u write_size=%u master_version=0x%08x pkt_len=%u flags=0x%x",
+	     inode, chunk_idx, (unsigned long long)chunkid,
+	     (unsigned long long)file_size, chunk_off, write_size,
+	     s->master_version, pkt_len, chunkopflags);
+
+	ret = master_rpc(s, CLTOMA_FUSE_WRITE_CHUNK_END, pkt, pkt_len,
 			 MATOCL_FUSE_WRITE_CHUNK_END, &rsp, &rsp_len);
 	if (ret)
 		return ret;
@@ -1539,7 +3131,7 @@ static uint32_t crc32_sw(const uint8_t *data, size_t len)
 		for (j = 0; j < 8; j++)
 			crc = (crc & 1) ? (crc >> 1) ^ CRC_POLY : (crc >> 1);
 	}
-	return crc;
+	return ~crc;
 }
 
 static int cs_read_data(const struct chunk_meta *m, uint32_t chunk_off,
@@ -1547,6 +3139,7 @@ static int cs_read_data(const struct chunk_meta *m, uint32_t chunk_off,
 {
 	char ipbuf[64];
 	struct in_addr ia;
+	uint8_t cs_protover;
 	int fd;
 	uint8_t *pkt = NULL;
 	uint32_t pkt_len;
@@ -1560,7 +3153,10 @@ static int cs_read_data(const struct chunk_meta *m, uint32_t chunk_off,
 	if (fd < 0)
 		return fd;
 
-	if (m->protocol > 0)
+	cs_protover = (m->loc_count > 0 &&
+		       m->locs[0].cs_ver >= VERSION2INT(1, 7, 32)) ? 1 : 0;
+
+	if (cs_protover > 0)
 		pkt_len = 1 + 8 + 4 + 4 + 4;
 	else
 		pkt_len = 8 + 4 + 4 + 4;
@@ -1570,8 +3166,8 @@ static int cs_read_data(const struct chunk_meta *m, uint32_t chunk_off,
 		return -ENOMEM;
 	}
 
-	if (m->protocol > 0) {
-		pkt[0] = m->protocol;
+	if (cs_protover > 0) {
+		pkt[0] = cs_protover;
 		put64be(pkt + 1, m->chunkid);
 		put32be(pkt + 9, m->version);
 		put32be(pkt + 13, chunk_off);
@@ -1656,12 +3252,157 @@ static int cs_read_data(const struct chunk_meta *m, uint32_t chunk_off,
 	}
 }
 
-static int cs_expect_write_status(int fd, uint32_t want_writeid)
+static int read_state_get_cs_fd(struct read_state *rs,
+				struct helper_session *s,
+				uint32_t inode,
+				uint32_t chunk_idx,
+				const struct chunk_meta *m)
+{
+	const struct cs_loc *loc;
+	char ipbuf[64];
+	struct in_addr ia;
+	int fd;
+
+	if (m->loc_count == 0)
+		return -ENOSPC;
+
+	loc = choose_read_replica(s, rs, inode, chunk_idx, m);
+	if (!loc)
+		return -ENOSPC;
+
+	if (rs->cs_fd >= 0 &&
+	    rs->cs_ip == loc->ip &&
+	    rs->cs_port == loc->port)
+		return rs->cs_fd;
+
+	if (rs->cs_fd >= 0) {
+		close(rs->cs_fd);
+		rs->cs_fd = -1;
+	}
+
+	ia.s_addr = htonl(loc->ip);
+	if (!inet_ntop(AF_INET, &ia, ipbuf, sizeof(ipbuf)))
+		return -EINVAL;
+
+	fd = connect_tcp(ipbuf, loc->port, HELPER_CS_TIMEOUT_MS);
+	if (fd < 0)
+		return fd;
+
+	rs->cs_fd = fd;
+	rs->cs_ip = loc->ip;
+	rs->cs_port = loc->port;
+	rs->preferred_ip = loc->ip;
+	rs->preferred_port = loc->port;
+	return fd;
+}
+
+static int cs_read_data_on_fd(int fd, const struct chunk_meta *m,
+			      uint32_t chunk_off, const uint32_t want,
+			      uint8_t *dst, uint32_t *got)
+{
+	uint8_t cs_protover;
+	uint8_t *pkt = NULL;
+	uint32_t pkt_len;
+	uint32_t total = 0;
+	int ret;
+
+	cs_protover = (m->loc_count > 0 &&
+		       m->locs[0].cs_ver >= VERSION2INT(1, 7, 32)) ? 1 : 0;
+
+	if (cs_protover > 0)
+		pkt_len = 1 + 8 + 4 + 4 + 4;
+	else
+		pkt_len = 8 + 4 + 4 + 4;
+	pkt = calloc(1, pkt_len);
+	if (!pkt)
+		return -ENOMEM;
+
+	if (cs_protover > 0) {
+		pkt[0] = cs_protover;
+		put64be(pkt + 1, m->chunkid);
+		put32be(pkt + 9, m->version);
+		put32be(pkt + 13, chunk_off);
+		put32be(pkt + 17, want);
+	} else {
+		put64be(pkt, m->chunkid);
+		put32be(pkt + 8, m->version);
+		put32be(pkt + 12, chunk_off);
+		put32be(pkt + 16, want);
+	}
+
+	ret = cs_send_packet(fd, CLTOCS_READ, pkt, pkt_len);
+	free(pkt);
+	if (ret)
+		return ret;
+
+	for (;;) {
+		uint32_t type;
+		uint8_t *rsp = NULL;
+		uint32_t rsp_len = 0;
+
+		ret = cs_recv_packet(fd, &type, &rsp, &rsp_len);
+		if (ret)
+			return ret;
+		if (type == CSTOCL_READ_STATUS) {
+			uint8_t st;
+			if (rsp_len < 9) {
+				free(rsp);
+				return -EPROTO;
+			}
+			st = rsp[8];
+			free(rsp);
+			if (st != MFS_STATUS_OK)
+				return st;
+			*got = total;
+			return 0;
+		}
+		if (type == CSTOCL_READ_DATA) {
+			uint16_t blocknum, boff;
+			uint32_t dsz;
+			uint32_t roff;
+			uint32_t copy_off;
+			uint32_t copy_len;
+			if (rsp_len < 8 + 2 + 2 + 4 + 4) {
+				free(rsp);
+				return -EPROTO;
+			}
+			blocknum = get16be(rsp + 8);
+			boff = get16be(rsp + 10);
+			dsz = get32be(rsp + 12);
+			if (rsp_len < 20 + dsz) {
+				free(rsp);
+				return -EPROTO;
+			}
+			roff = (uint32_t)blocknum * MFSBLOCKSIZE + boff;
+			if (roff < chunk_off)
+				copy_off = chunk_off - roff;
+			else
+				copy_off = 0;
+			if (copy_off < dsz && total < want) {
+				copy_len = dsz - copy_off;
+				if (copy_len > want - total)
+					copy_len = want - total;
+				memcpy(dst + total, rsp + 20 + copy_off, copy_len);
+				total += copy_len;
+			}
+			free(rsp);
+			continue;
+		}
+		free(rsp);
+		return -EPROTO;
+	}
+}
+
+static int cs_recv_write_status(int fd, uint64_t want_chunkid,
+				uint32_t *writeid_out)
 {
 	for (;;) {
 		uint32_t type;
 		uint8_t *rsp = NULL;
 		uint32_t rsp_len = 0;
+		uint64_t got_chunkid;
+		uint32_t got_writeid;
+		uint8_t st;
 		int ret;
 
 		ret = cs_recv_packet(fd, &type, &rsp, &rsp_len);
@@ -1675,14 +3416,17 @@ static int cs_expect_write_status(int fd, uint32_t want_writeid)
 			free(rsp);
 			return -EPROTO;
 		}
-		if (get32be(rsp + 8) == want_writeid) {
-			uint8_t st = rsp[12];
-			free(rsp);
-			if (st != MFS_STATUS_OK)
-				return st;
-			return 0;
-		}
+		got_chunkid = get64be(rsp);
+		got_writeid = get32be(rsp + 8);
+		st = rsp[12];
 		free(rsp);
+		if (got_chunkid != want_chunkid)
+			return -EPROTO;
+		if (writeid_out)
+			*writeid_out = got_writeid;
+		if (st != MFS_STATUS_OK)
+			return st;
+		return 0;
 	}
 }
 
@@ -1691,12 +3435,13 @@ static int cs_write_data(const struct chunk_meta *m, uint32_t chunk_off,
 {
 	char ipbuf[64];
 	struct in_addr ia;
-	int fd;
+	uint8_t cs_protover;
 	uint8_t *pkt = NULL;
 	uint32_t pkt_len;
 	uint32_t sent = 0;
 	uint32_t writeid = 1;
 	int ret;
+	int fd;
 
 	ia.s_addr = htonl(m->locs[0].ip);
 	if (!inet_ntop(AF_INET, &ia, ipbuf, sizeof(ipbuf)))
@@ -1705,49 +3450,50 @@ static int cs_write_data(const struct chunk_meta *m, uint32_t chunk_off,
 	if (fd < 0)
 		return fd;
 
-	if (m->protocol > 0)
-		pkt_len = 1 + 8 + 4 + (m->loc_count > 1 ? (m->loc_count - 1) * 6 : 0);
+	cs_protover = (m->loc_count > 0 &&
+		       m->locs[0].cs_ver >= VERSION2INT(1, 7, 32)) ? 1 : 0;
+
+	if (cs_protover > 0)
+		pkt_len = 1 + 8 + 4;
 	else
-		pkt_len = 8 + 4 + (m->loc_count > 1 ? (m->loc_count - 1) * 6 : 0);
+		pkt_len = 8 + 4;
 	pkt = calloc(1, pkt_len);
 	if (!pkt) {
 		close(fd);
 		return -ENOMEM;
 	}
 
-	if (m->protocol > 0) {
-		size_t i;
+	if (cs_protover > 0) {
 		size_t off = 0;
-		pkt[off++] = m->protocol;
+		pkt[off++] = cs_protover;
 		put64be(pkt + off, m->chunkid);
 		off += 8;
 		put32be(pkt + off, m->version);
-		off += 4;
-		for (i = 1; i < m->loc_count; i++) {
-			put32be(pkt + off, m->locs[i].ip);
-			put16be(pkt + off + 4, m->locs[i].port);
-			off += 6;
-		}
 	} else {
-		size_t i;
 		size_t off = 0;
 		put64be(pkt + off, m->chunkid);
 		off += 8;
 		put32be(pkt + off, m->version);
-		off += 4;
-		for (i = 1; i < m->loc_count; i++) {
-			put32be(pkt + off, m->locs[i].ip);
-			put16be(pkt + off + 4, m->locs[i].port);
-			off += 6;
-		}
 	}
 
 	ret = cs_send_packet(fd, CLTOCS_WRITE, pkt, pkt_len);
 	free(pkt);
 	if (ret) {
+		vlog("cs_write_data: init send failed chunkid=%llu ret=%d",
+		     (unsigned long long)m->chunkid, ret);
 		close(fd);
 		return ret;
 	}
+
+	ret = cs_recv_write_status(fd, m->chunkid, NULL);
+	if (ret) {
+		vlog("cs_write_data: init status failed chunkid=%llu ret=%d",
+		     (unsigned long long)m->chunkid, ret);
+		close(fd);
+		return ret;
+	}
+	vlog("cs_write_data: init status ok chunkid=%llu",
+	     (unsigned long long)m->chunkid);
 
 	while (sent < len) {
 		uint32_t roff = chunk_off + sent;
@@ -1780,14 +3526,20 @@ static int cs_write_data(const struct chunk_meta *m, uint32_t chunk_off,
 		ret = cs_send_packet(fd, CLTOCS_WRITE_DATA, dpkt, dpklen);
 		free(dpkt);
 		if (ret) {
+			vlog("cs_write_data: data send failed chunkid=%llu writeid=%u ret=%d",
+			     (unsigned long long)m->chunkid, writeid, ret);
 			close(fd);
 			return ret;
 		}
-		ret = cs_expect_write_status(fd, writeid);
+		ret = cs_recv_write_status(fd, m->chunkid, NULL);
 		if (ret) {
+			vlog("cs_write_data: data status failed chunkid=%llu writeid=%u ret=%d",
+			     (unsigned long long)m->chunkid, writeid, ret);
 			close(fd);
 			return ret;
 		}
+		vlog("cs_write_data: data status ok chunkid=%llu writeid=%u",
+		     (unsigned long long)m->chunkid, writeid);
 		sent += frag;
 		writeid++;
 	}
@@ -1798,18 +3550,170 @@ static int cs_write_data(const struct chunk_meta *m, uint32_t chunk_off,
 		put32be(fin + 8, m->version);
 		ret = cs_send_packet(fd, CLTOCS_WRITE_FINISH, fin, sizeof(fin));
 		if (ret) {
+			vlog("cs_write_data: finish send failed chunkid=%llu ret=%d",
+			     (unsigned long long)m->chunkid, ret);
 			close(fd);
 			return ret;
 		}
+		vlog("cs_write_data: finish send ok chunkid=%llu",
+		     (unsigned long long)m->chunkid);
 	}
 
+	vlog("cs_write_data: success chunkid=%llu total=%u",
+	     (unsigned long long)m->chunkid, len);
 	close(fd);
 	return 0;
 }
 
-static int session_read_data(struct helper_session *s,
-			     const struct mfs_ctrl_read_req *req,
-			     uint8_t **out, uint32_t *out_len)
+static int session_get_write_cs_fd(struct helper_session *s,
+				   const struct chunk_meta *m)
+{
+	char ipbuf[64];
+	struct in_addr ia;
+	int fd;
+
+	if (m->loc_count == 0)
+		return -ENOSPC;
+
+	if (s->write_cs_fd >= 0 &&
+	    s->write_cs_ip == m->locs[0].ip &&
+	    s->write_cs_port == m->locs[0].port)
+		return s->write_cs_fd;
+
+	if (s->write_cs_fd >= 0) {
+		close(s->write_cs_fd);
+		s->write_cs_fd = -1;
+	}
+
+	ia.s_addr = htonl(m->locs[0].ip);
+	if (!inet_ntop(AF_INET, &ia, ipbuf, sizeof(ipbuf)))
+		return -EINVAL;
+
+	fd = connect_tcp(ipbuf, m->locs[0].port, HELPER_CS_TIMEOUT_MS);
+	if (fd < 0)
+		return fd;
+
+	s->write_cs_fd = fd;
+	s->write_cs_ip = m->locs[0].ip;
+	s->write_cs_port = m->locs[0].port;
+	return fd;
+}
+
+static int cs_write_begin_on_fd(int fd, const struct chunk_meta *m)
+{
+	uint8_t cs_protover;
+	uint8_t *pkt = NULL;
+	uint32_t pkt_len;
+	int ret;
+
+	cs_protover = (m->loc_count > 0 &&
+		       m->locs[0].cs_ver >= VERSION2INT(1, 7, 32)) ? 1 : 0;
+
+	if (cs_protover > 0)
+		pkt_len = 1 + 8 + 4;
+	else
+		pkt_len = 8 + 4;
+	pkt = calloc(1, pkt_len);
+	if (!pkt)
+		return -ENOMEM;
+
+	if (cs_protover > 0) {
+		size_t off = 0;
+		pkt[off++] = cs_protover;
+		put64be(pkt + off, m->chunkid);
+		off += 8;
+		put32be(pkt + off, m->version);
+	} else {
+		size_t off = 0;
+		put64be(pkt + off, m->chunkid);
+		off += 8;
+		put32be(pkt + off, m->version);
+	}
+
+	ret = cs_send_packet(fd, CLTOCS_WRITE, pkt, pkt_len);
+	free(pkt);
+	if (ret) {
+		vlog("cs_write_data: init send failed chunkid=%llu ret=%d",
+		     (unsigned long long)m->chunkid, ret);
+		return ret;
+	}
+
+	ret = cs_recv_write_status(fd, m->chunkid, NULL);
+	if (ret) {
+		vlog("cs_write_data: init status failed chunkid=%llu ret=%d",
+		     (unsigned long long)m->chunkid, ret);
+		return ret;
+	}
+	vlog("cs_write_data: init status ok chunkid=%llu",
+	     (unsigned long long)m->chunkid);
+	return 0;
+}
+
+static int cs_write_data_on_fd(int fd, const struct chunk_meta *m,
+			       uint32_t *writeid_io,
+			       uint32_t chunk_off, const uint8_t *src, uint32_t len)
+{
+	uint32_t sent = 0;
+	uint32_t writeid;
+	int ret;
+
+	if (!writeid_io)
+		return -EINVAL;
+	writeid = *writeid_io;
+
+	while (sent < len) {
+		uint32_t roff = chunk_off + sent;
+		uint16_t block = roff / MFSBLOCKSIZE;
+		uint16_t boff = roff % MFSBLOCKSIZE;
+		uint32_t frag = MFSBLOCKSIZE - boff;
+		uint32_t crc;
+		uint32_t dlen;
+		uint8_t *dpkt;
+		uint32_t dpklen;
+
+		if (frag > len - sent)
+			frag = len - sent;
+		crc = crc32_sw(src + sent, frag);
+		dpklen = 8 + 4 + 2 + 2 + 4 + 4 + frag;
+		dpkt = malloc(dpklen);
+		if (!dpkt)
+			return -ENOMEM;
+		put64be(dpkt, m->chunkid);
+		put32be(dpkt + 8, writeid);
+		put16be(dpkt + 12, block);
+		put16be(dpkt + 14, boff);
+		dlen = frag;
+		put32be(dpkt + 16, dlen);
+		put32be(dpkt + 20, crc);
+		memcpy(dpkt + 24, src + sent, frag);
+
+		ret = cs_send_packet(fd, CLTOCS_WRITE_DATA, dpkt, dpklen);
+		free(dpkt);
+		if (ret) {
+			vlog("cs_write_data: data send failed chunkid=%llu writeid=%u ret=%d",
+			     (unsigned long long)m->chunkid, writeid, ret);
+			return ret;
+		}
+		ret = cs_recv_write_status(fd, m->chunkid, NULL);
+		if (ret) {
+			vlog("cs_write_data: data status failed chunkid=%llu writeid=%u ret=%d",
+			     (unsigned long long)m->chunkid, writeid, ret);
+			return ret;
+		}
+		sent += frag;
+		writeid++;
+	}
+
+	*writeid_io = writeid;
+	vlog("cs_write_data: success chunkid=%llu total=%u",
+	     (unsigned long long)m->chunkid, len);
+	return 0;
+}
+
+static int read_state_read_data(struct helper_session *s,
+				struct read_state *rs,
+				const struct mfs_ctrl_read_req *req,
+				uint8_t **out, uint32_t *out_len)
 {
 	uint64_t off = req->offset;
 	uint32_t remain = req->size;
@@ -1827,26 +3731,118 @@ static int session_read_data(struct helper_session *s,
 		uint32_t chunk_idx = (uint32_t)(off / MFSCHUNKSIZE);
 		uint32_t chunk_off = (uint32_t)(off % MFSCHUNKSIZE);
 		uint32_t can = MFSCHUNKSIZE - chunk_off;
+		uint32_t cached;
 		uint32_t got = 0;
+		uint32_t fetch_off;
+		uint32_t fetch_len;
+		uint8_t *fetch_buf = NULL;
 		struct chunk_meta meta;
+		int csfd;
 
 		if (can > remain)
 			can = remain;
 
-		ret = session_read_chunk_meta(s, req->inode, chunk_idx, &meta);
+		ret = read_state_get_chunk_meta(s, rs, req->inode, chunk_idx, &meta);
+		if (ret == MFS_ERROR_NOCHUNKSERVERS || ret == MFS_ERROR_NOCHUNK) {
+			memset(payload + sizeof(*rr) + got_total, 0, can);
+			off += can;
+			got_total += can;
+			remain -= can;
+			continue;
+		}
 		if (ret)
 			goto out;
-		ret = cs_read_data(&meta, chunk_off, can,
-				   payload + sizeof(*rr) + got_total, &got);
+
+		cached = read_state_copy_from_cache(rs, chunk_off, can,
+						payload + sizeof(*rr) + got_total);
+		if (cached > 0) {
+			off += cached;
+			got_total += cached;
+			remain -= cached;
+			if (cached == can)
+				continue;
+			chunk_off += cached;
+			can -= cached;
+		}
+
+		if (session_try_use_prefetched_read(s, req->inode, chunk_idx,
+						    chunk_off, can)) {
+			cached = read_state_copy_from_cache(rs, chunk_off, can,
+						payload + sizeof(*rr) + got_total);
+			if (cached > 0) {
+				off += cached;
+				got_total += cached;
+				remain -= cached;
+				if (cached == can) {
+					session_schedule_read_ahead(s, req->inode,
+								      chunk_idx + 1);
+					continue;
+				}
+				chunk_off += cached;
+				can -= cached;
+			}
+		}
+
+		csfd = read_state_get_cs_fd(rs, s, req->inode, chunk_idx, &meta);
+		if (csfd < 0) {
+			ret = csfd;
+			goto out;
+		}
+		fetch_off = chunk_off;
+		fetch_len = can;
+		/*
+		 * Keep the foreground control-path response bounded.
+		 *
+		 * The aggressive window growth helps single-stream throughput,
+		 * but on the single-threaded ctrl loop it also means one READ
+		 * request can monopolize the helper long enough for sibling
+		 * requests to time out.  Let background prefetch chase the large
+		 * sequential window; keep the synchronous foreground fetch small.
+		 */
+		if (fetch_len < HELPER_READ_FOREGROUND_MAX)
+			fetch_len = HELPER_READ_FOREGROUND_MAX;
+		if (fetch_off + fetch_len > MFSCHUNKSIZE)
+			fetch_len = MFSCHUNKSIZE - fetch_off;
+		if (fetch_len < can)
+			fetch_len = can;
+
+		ret = read_state_prepare_window(rs, fetch_off, fetch_len, &fetch_buf);
 		if (ret)
 			goto out;
-		if (got == 0)
+
+		pthread_mutex_lock(&s->read_prefetch_mu);
+		s->read_foreground_inflight++;
+		pthread_mutex_unlock(&s->read_prefetch_mu);
+		ret = cs_read_data_on_fd(csfd, &meta, fetch_off, fetch_len,
+					 fetch_buf, &got);
+		pthread_mutex_lock(&s->read_prefetch_mu);
+		if (s->read_foreground_inflight > 0)
+			s->read_foreground_inflight--;
+		pthread_cond_broadcast(&s->read_prefetch_cv);
+		pthread_mutex_unlock(&s->read_prefetch_mu);
+		if (ret) {
+			read_state_invalidate(rs);
+			goto out;
+		}
+		if (got == 0) {
+			read_state_reset_scoreboard(rs);
+			break;
+		}
+
+		read_state_commit_window(rs, fetch_off, got);
+		read_state_note_progress(rs, req->inode, off, got);
+		if (chunk_off + can >= got)
+			session_schedule_read_ahead(s, req->inode, chunk_idx + 1);
+
+		cached = read_state_copy_from_cache(rs, chunk_off, can,
+						payload + sizeof(*rr) + got_total);
+		if (cached == 0)
 			break;
 
-		off += got;
-		got_total += got;
-		remain -= got;
-		if (got < can)
+		off += cached;
+		got_total += cached;
+		remain -= cached;
+		if (cached < can)
 			break;
 	}
 
@@ -1856,6 +3852,7 @@ static int session_read_data(struct helper_session *s,
 	return 0;
 
 out:
+	read_state_invalidate(rs);
 	free(payload);
 	return ret;
 }
@@ -1877,25 +3874,80 @@ static int session_write_data(struct helper_session *s,
 		return -ENOMEM;
 	wr = (struct mfs_ctrl_write_rsp *)payload;
 
+	vlog("write: inode=%u offset=%llu size=%u session=%u",
+	     req->inode, (unsigned long long)req->offset, req->size,
+	     req->session_id);
+
 	while (remain > 0) {
 		uint32_t chunk_idx = (uint32_t)(off / MFSCHUNKSIZE);
 		uint32_t chunk_off = (uint32_t)(off % MFSCHUNKSIZE);
 		uint32_t can = MFSCHUNKSIZE - chunk_off;
 		struct chunk_meta meta;
+		int csfd;
 
 		if (can > remain)
 			can = remain;
 
-		ret = session_write_chunk_meta(s, req->inode, chunk_idx, &meta);
-		if (ret)
+		ret = session_get_write_chunk_meta(s, req->inode, chunk_idx, &meta);
+		if (ret) {
+			vlog("write: chunk_meta failed inode=%u chunk=%u ret=%d",
+			     req->inode, chunk_idx, ret);
 			goto out;
-		ret = cs_write_data(&meta, chunk_off, data + sent_total, can);
-		if (ret)
+		}
+		csfd = session_get_write_cs_fd(s, &meta);
+		if (csfd < 0) {
+			vlog("write: cs fd failed inode=%u chunk=%u ret=%d",
+			     req->inode, chunk_idx, csfd);
+			ret = csfd;
 			goto out;
-		ret = session_write_chunk_end(s, req->inode, chunk_idx,
-					     meta.chunkid, off + can);
-		if (ret)
+		}
+		ret = cs_write_begin_on_fd(csfd, &meta);
+		if (ret) {
+			vlog("write: cs_write_begin failed inode=%u chunk=%u ret=%d",
+			     req->inode, chunk_idx, ret);
 			goto out;
+		}
+		s->write_cs_active = true;
+		s->write_next_writeid = 1;
+		ret = cs_write_data_on_fd(csfd, &meta, &s->write_next_writeid,
+					  chunk_off, data + sent_total, can);
+		if (ret) {
+			vlog("write: cs_write_data failed inode=%u chunk=%u off=%u len=%u ret=%d",
+			     req->inode, chunk_idx, chunk_off, can, ret);
+			if (s->write_cs_fd >= 0) {
+				close(s->write_cs_fd);
+				s->write_cs_fd = -1;
+			}
+			session_invalidate_write_meta(s);
+			goto out;
+		}
+		ret = cs_write_finish_on_fd(s->write_cs_fd, &meta);
+		if (ret) {
+			vlog("write: cs_write_finish failed inode=%u chunk=%u off=%u len=%u ret=%d",
+			     req->inode, chunk_idx, chunk_off, can, ret);
+			if (s->write_cs_fd >= 0) {
+				close(s->write_cs_fd);
+				s->write_cs_fd = -1;
+			}
+			session_invalidate_write_meta(s);
+			goto out;
+		}
+		s->write_cs_active = false;
+		s->write_next_writeid = 1;
+		if (s->write_cs_fd >= 0) {
+			close(s->write_cs_fd);
+			s->write_cs_fd = -1;
+		}
+		s->write_cs_ip = 0;
+		s->write_cs_port = 0;
+		if (off + can > s->write_meta.length)
+			s->write_meta.length = off + can;
+		if (off + can > s->write_file_size)
+			s->write_file_size = off + can;
+		if (chunk_off < s->write_min_chunk_off)
+			s->write_min_chunk_off = chunk_off;
+		if (chunk_off + can > s->write_max_chunk_end)
+			s->write_max_chunk_end = chunk_off + can;
 
 		off += can;
 		sent_total += can;
@@ -1903,17 +3955,17 @@ static int session_write_data(struct helper_session *s,
 	}
 
 	wr->written = sent_total;
-	ret = session_getattr(s, req->inode, 0, 0, &wr->attr);
-	if (ret == 0)
-		wr->attr_valid = 1;
-	else
-		wr->attr_valid = 0;
+	wr->attr_valid = 0;
+	vlog("write: complete inode=%u written=%u",
+	     req->inode, wr->written);
 
 	*out = payload;
 	*out_len = sizeof(*wr);
 	return 0;
 
 out:
+	vlog("write: failed inode=%u offset=%llu size=%u ret=%d",
+	     req->inode, (unsigned long long)req->offset, req->size, ret);
 	free(payload);
 	return ret;
 }
@@ -1927,6 +3979,14 @@ static int handle_request(struct helper_session *s,
 
 	*out_payload = NULL;
 	*out_len = 0;
+
+	if (s->write_meta_valid &&
+	    hdr->op != MFS_CTRL_OP_WRITE &&
+	    hdr->op != MFS_CTRL_OP_FSYNC) {
+		ret = session_finalize_active_write(s);
+		if (ret)
+			return ret;
+	}
 
 	switch (hdr->op) {
 	case MFS_CTRL_OP_HELLO:
@@ -1977,11 +4037,14 @@ static int handle_request(struct helper_session *s,
 		if (payload_len < sizeof(*req))
 			return -EINVAL;
 		req = (const struct mfs_ctrl_inode_req *)payload;
+		vlog("CTRL_GETATTR: session=%u inode=%u uid=%u gid=%u",
+		     req->session_id, req->inode, req->uid, req->gid);
 		rsp = calloc(1, sizeof(*rsp));
 		if (!rsp)
 			return -ENOMEM;
 		ret = session_getattr(s, req->inode, req->uid, req->gid, rsp);
 		if (ret) {
+			vlog("CTRL_GETATTR: failed ret=%d", ret);
 			free(rsp);
 			return ret;
 		}
@@ -2039,14 +4102,19 @@ static int handle_request(struct helper_session *s,
 		req = (const struct mfs_ctrl_create_req *)payload;
 		if (payload_len < sizeof(*req) + req->name_len)
 			return -EINVAL;
+		vlog("CTRL_CREATE: session=%u parent=%u name_len=%u mode=%o",
+		     req->session_id, req->parent_inode, req->name_len,
+		     req->mode & 07777);
 		rsp = calloc(1, sizeof(*rsp));
 		if (!rsp)
 			return -ENOMEM;
 		ret = session_create(s, req, payload + sizeof(*req), rsp);
 		if (ret) {
+			vlog("CTRL_CREATE: failed ret=%d", ret);
 			free(rsp);
 			return ret;
 		}
+		vlog("CTRL_CREATE: created inode=%u", rsp->inode);
 		*out_payload = (uint8_t *)rsp;
 		*out_len = sizeof(*rsp);
 		return 0;
@@ -2204,10 +4272,16 @@ static int handle_request(struct helper_session *s,
 		return session_setxattr(s, &xq, name, NULL);
 	}
 	case MFS_CTRL_OP_READ: {
+		struct read_state rs;
+		int ret;
 		if (payload_len < sizeof(struct mfs_ctrl_read_req))
 			return -EINVAL;
-		return session_read_data(s, (const struct mfs_ctrl_read_req *)payload,
-					 out_payload, out_len);
+		read_state_init(&rs);
+		ret = read_state_read_data(s, &rs,
+					   (const struct mfs_ctrl_read_req *)payload,
+					   out_payload, out_len);
+		read_state_destroy(&rs);
+		return ret;
 	}
 	case MFS_CTRL_OP_WRITE: {
 		const struct mfs_ctrl_write_req *req;
@@ -2216,12 +4290,16 @@ static int handle_request(struct helper_session *s,
 		req = (const struct mfs_ctrl_write_req *)payload;
 		if (payload_len < sizeof(*req) + req->size)
 			return -EINVAL;
+		vlog("CTRL_WRITE: session=%u inode=%u offset=%llu size=%u",
+		     req->session_id, req->inode,
+		     (unsigned long long)req->offset, req->size);
 		return session_write_data(s, req, payload + sizeof(*req),
 					  out_payload, out_len);
 	}
 	case MFS_CTRL_OP_FSYNC:
 		if (payload_len < sizeof(struct mfs_ctrl_fsync_req))
 			return -EINVAL;
+		vlog("CTRL_FSYNC");
 		return session_fsync(s, (const struct mfs_ctrl_fsync_req *)payload);
 	case MFS_CTRL_OP_STATFS: {
 		struct mfs_ctrl_statfs_rsp *rsp;
@@ -2274,6 +4352,149 @@ static int send_response(int fd, const struct mfs_ctrl_hdr *req_hdr,
 	ret = write_full(fd, buf, total);
 	free(buf);
 	return ret;
+}
+
+static int enqueue_read_job(struct helper_session *s,
+			    const struct mfs_ctrl_hdr *hdr,
+			    const uint8_t *payload,
+			    uint32_t payload_len)
+{
+	size_t i;
+	size_t free_slot = HELPER_READ_JOB_QUEUE_MAX;
+	uint8_t *payload_copy = NULL;
+
+	if (payload_len) {
+		payload_copy = malloc(payload_len);
+		if (!payload_copy)
+			return -ENOMEM;
+		memcpy(payload_copy, payload, payload_len);
+	}
+
+	pthread_mutex_lock(&s->read_job_mu);
+	for (;;) {
+		for (i = 0; i < HELPER_READ_JOB_QUEUE_MAX; i++) {
+			if (!s->read_jobs[i].valid) {
+				free_slot = i;
+				break;
+			}
+		}
+		if (free_slot != HELPER_READ_JOB_QUEUE_MAX || s->read_worker_stop)
+			break;
+		pthread_cond_wait(&s->read_job_cv, &s->read_job_mu);
+	}
+	if (s->read_worker_stop) {
+		pthread_mutex_unlock(&s->read_job_mu);
+		free(payload_copy);
+		return -ESHUTDOWN;
+	}
+	s->read_jobs[free_slot].valid = true;
+	s->read_jobs[free_slot].hdr = *hdr;
+	s->read_jobs[free_slot].payload = payload_copy;
+	s->read_jobs[free_slot].payload_len = payload_len;
+	pthread_cond_broadcast(&s->read_job_cv);
+	pthread_mutex_unlock(&s->read_job_mu);
+	return 0;
+}
+
+static void *read_worker_thread_main(void *arg)
+{
+	struct helper_session *s = arg;
+	struct read_state rs;
+
+	read_state_init(&rs);
+	for (;;) {
+		struct read_job job = {0};
+		uint8_t *rsp_payload = NULL;
+		uint32_t rsp_len = 0;
+		int status;
+		int ret;
+		size_t i;
+
+		pthread_mutex_lock(&s->read_job_mu);
+		for (;;) {
+			if (s->read_worker_stop)
+				break;
+			for (i = 0; i < HELPER_READ_JOB_QUEUE_MAX; i++) {
+				if (s->read_jobs[i].valid) {
+					job = s->read_jobs[i];
+					memset(&s->read_jobs[i], 0, sizeof(s->read_jobs[i]));
+					pthread_cond_broadcast(&s->read_job_cv);
+					break;
+				}
+			}
+			if (job.valid || s->read_worker_stop)
+				break;
+			pthread_cond_wait(&s->read_job_cv, &s->read_job_mu);
+		}
+		pthread_mutex_unlock(&s->read_job_mu);
+
+		if (s->read_worker_stop)
+			break;
+
+		if (job.payload_len < sizeof(struct mfs_ctrl_read_req)) {
+			status = -EINVAL;
+		} else {
+			status = read_state_read_data(s, &rs,
+					(const struct mfs_ctrl_read_req *)job.payload,
+					&rsp_payload, &rsp_len);
+		}
+
+		pthread_mutex_lock(&s->ctrl_write_mu);
+		ret = send_response(s->ctrl_fd, &job.hdr, status, rsp_payload, rsp_len);
+		pthread_mutex_unlock(&s->ctrl_write_mu);
+		free(rsp_payload);
+		free(job.payload);
+		if (ret) {
+			fprintf(stderr, "write ctrl failed: %s\n", strerror(-ret));
+			g_stop = 1;
+			break;
+		}
+	}
+
+	read_state_destroy(&rs);
+	return NULL;
+}
+
+static int session_start_read_workers(struct helper_session *s)
+{
+	size_t i;
+
+	pthread_mutex_lock(&s->read_job_mu);
+	s->read_worker_stop = false;
+	memset(s->read_jobs, 0, sizeof(s->read_jobs));
+	pthread_mutex_unlock(&s->read_job_mu);
+
+	for (i = 0; i < HELPER_READ_WORKERS; i++) {
+		int ret = pthread_create(&s->read_workers[i], NULL,
+					 read_worker_thread_main, s);
+		if (ret) {
+			pthread_mutex_lock(&s->read_job_mu);
+			s->read_worker_stop = true;
+			pthread_cond_broadcast(&s->read_job_cv);
+			pthread_mutex_unlock(&s->read_job_mu);
+			while (i-- > 0)
+				pthread_join(s->read_workers[i], NULL);
+			return -ret;
+		}
+	}
+	s->read_worker_running = true;
+	return 0;
+}
+
+static void session_stop_read_workers(struct helper_session *s)
+{
+	size_t i;
+
+	if (!s->read_worker_running)
+		return;
+	pthread_mutex_lock(&s->read_job_mu);
+	s->read_worker_stop = true;
+	pthread_cond_broadcast(&s->read_job_cv);
+	pthread_mutex_unlock(&s->read_job_mu);
+
+	for (i = 0; i < HELPER_READ_WORKERS; i++)
+		pthread_join(s->read_workers[i], NULL);
+	s->read_worker_running = false;
 }
 
 static int daemonize_if_needed(void)
@@ -2345,9 +4566,19 @@ int main(int argc, char **argv)
 		}
 	}
 
-	signal(SIGINT, handle_sigint);
-	signal(SIGTERM, handle_sigint);
-	signal(SIGHUP, handle_sigint);
+	setvbuf(stderr, NULL, _IONBF, 0);
+
+	{
+		struct sigaction sa;
+
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = handle_sigint;
+		sigemptyset(&sa.sa_mask);
+		sigaction(SIGINT, &sa, NULL);
+		sigaction(SIGTERM, &sa, NULL);
+		sigaction(SIGHUP, &sa, NULL);
+	}
+	signal(SIGPIPE, SIG_IGN);
 
 	fd = open(device, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
@@ -2362,14 +4593,41 @@ int main(int argc, char **argv)
 	}
 	memset(&session, 0, sizeof(session));
 	session.master_fd = -1;
+	session.ctrl_fd = fd;
+	pthread_mutex_init(&session.master_mu, NULL);
+	pthread_cond_init(&session.master_cv, NULL);
+	pthread_mutex_init(&session.read_prefetch_mu, NULL);
+	pthread_cond_init(&session.read_prefetch_cv, NULL);
+	pthread_mutex_init(&session.read_job_mu, NULL);
+	pthread_cond_init(&session.read_job_cv, NULL);
+	pthread_mutex_init(&session.ctrl_write_mu, NULL);
+	session.master_last_nop = time(NULL);
+	session_start_read_prefetch_thread(&session);
+	session_start_read_workers(&session);
 
 	while (!g_stop) {
+		struct pollfd pfd;
 		ssize_t n;
 		struct mfs_ctrl_hdr *hdr;
 		uint8_t *payload;
 		uint8_t *rsp_payload = NULL;
 		uint32_t rsp_len = 0;
 		int status;
+
+		pfd.fd = fd;
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+		ret = poll(&pfd, 1, 250);
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			fprintf(stderr, "poll ctrl failed: %s\n", strerror(errno));
+			break;
+		}
+		if (ret == 0)
+			continue;
+		if (!(pfd.revents & (POLLIN | POLLERR | POLLHUP)))
+			continue;
 
 		n = read(fd, msgbuf, HELPER_MAX_MSG);
 		if (n < 0) {
@@ -2378,8 +4636,11 @@ int main(int argc, char **argv)
 			fprintf(stderr, "read ctrl failed: %s\n", strerror(errno));
 			break;
 		}
-		if (n == 0)
+		if (n == 0) {
+			if (pfd.revents & (POLLHUP | POLLERR))
+				break;
 			continue;
+		}
 		if ((size_t)n < sizeof(*hdr)) {
 			fprintf(stderr, "short ctrl header\n");
 			continue;
@@ -2397,19 +4658,40 @@ int main(int argc, char **argv)
 		}
 		payload = msgbuf + sizeof(*hdr);
 
-		status = handle_request(&session, hdr, payload, hdr->payload_len,
-					&rsp_payload, &rsp_len);
-		ret = send_response(fd, hdr, status, rsp_payload, rsp_len);
-		free(rsp_payload);
-		if (ret) {
-			fprintf(stderr, "write ctrl failed: %s\n", strerror(-ret));
-			break;
+		if (hdr->op == MFS_CTRL_OP_READ) {
+			ret = enqueue_read_job(&session, hdr, payload, hdr->payload_len);
+			if (ret) {
+				pthread_mutex_lock(&session.ctrl_write_mu);
+				(void)send_response(fd, hdr, ret, NULL, 0);
+				pthread_mutex_unlock(&session.ctrl_write_mu);
+			}
+		} else {
+			status = handle_request(&session, hdr, payload, hdr->payload_len,
+						&rsp_payload, &rsp_len);
+			pthread_mutex_lock(&session.ctrl_write_mu);
+			ret = send_response(fd, hdr, status, rsp_payload, rsp_len);
+			pthread_mutex_unlock(&session.ctrl_write_mu);
+			free(rsp_payload);
+			if (ret) {
+				fprintf(stderr, "write ctrl failed: %s\n", strerror(-ret));
+				break;
+			}
 		}
 	}
 
+	session_stop_read_workers(&session);
+	session_stop_read_prefetch_thread(&session);
+	session_stop_master_thread(&session);
 	if (session.master_fd >= 0)
 		close(session.master_fd);
 	free(msgbuf);
 	close(fd);
+	pthread_mutex_destroy(&session.master_mu);
+	pthread_cond_destroy(&session.master_cv);
+	pthread_mutex_destroy(&session.read_prefetch_mu);
+	pthread_cond_destroy(&session.read_prefetch_cv);
+	pthread_mutex_destroy(&session.read_job_mu);
+	pthread_cond_destroy(&session.read_job_cv);
+	pthread_mutex_destroy(&session.ctrl_write_mu);
 	return 0;
 }
