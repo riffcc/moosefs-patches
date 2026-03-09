@@ -5197,7 +5197,6 @@ static void *read_worker_thread_main(void *arg)
 	uint32_t worker_id = wa->worker_id;
 	struct read_state rs;
 	uint32_t last_inode = 0;
-	uint64_t last_band = UINT64_MAX;
 
 	read_state_init(&rs);
 	for (;;) {
@@ -5250,13 +5249,11 @@ static void *read_worker_thread_main(void *arg)
 		} else {
 			const struct mfs_ctrl_read_req *req =
 				(const struct mfs_ctrl_read_req *)job.payload;
-			uint64_t band = req->offset >> HELPER_READ_STREAM_BAND_SHIFT;
 
-			if (last_inode != req->inode || last_band != band) {
+			if (last_inode != req->inode) {
 				read_state_destroy(&rs);
 				read_state_init(&rs);
 				last_inode = req->inode;
-				last_band = band;
 			}
 			status = read_state_read_data(s, &rs, req,
 					&rsp_payload, &rsp_len);
