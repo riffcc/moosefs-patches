@@ -210,6 +210,7 @@ struct helper_session {
 	pthread_t master_thread;
 	pthread_mutex_t master_mu;
 	pthread_cond_t master_cv;
+	pthread_mutex_t read_chunk_meta_mu;
 	bool master_thread_running;
 	bool master_thread_stop;
 	bool master_req_pending;
@@ -332,6 +333,7 @@ static int read_state_fetch_window(struct helper_session *s,
 static int connect_tcp(const char *host, uint16_t port, int timeout_ms);
 static int helper_read_timeout_ms(struct helper_session *s);
 static int helper_read_io_timeout_ms(struct helper_session *s);
+static void vlog(const char *fmt, ...);
 
 static uint64_t monotonic_ms(void)
 {
@@ -446,7 +448,24 @@ static struct read_stream_ctx *session_assign_read_stream(struct helper_session 
 			continue;
 		if (req->flags != 0 && ctx->stream_hint != req->flags)
 			continue;
+		if (req->flags != 0) {
+			vlog("read_stream: hinted reuse stream_id=%llu hint=%u inode=%u off=%llu next=%llu worker=%u band=%llu",
+			     (unsigned long long)ctx->stream_id, req->flags, req->inode,
+			     (unsigned long long)req->offset,
+			     (unsigned long long)ctx->next_offset,
+			     ctx->worker_id,
+			     (unsigned long long)band);
+			ctx->last_used_ms = now;
+			ctx->band = band;
+			return ctx;
+		}
 		if (ctx->next_offset == req->offset || ctx->last_offset == req->offset) {
+			vlog("read_stream: reuse stream_id=%llu hint=%u inode=%u off=%llu next=%llu worker=%u band=%llu",
+			     (unsigned long long)ctx->stream_id, req->flags, req->inode,
+			     (unsigned long long)req->offset,
+			     (unsigned long long)ctx->next_offset,
+			     ctx->worker_id,
+			     (unsigned long long)band);
 			ctx->last_used_ms = now;
 			ctx->band = band;
 			return ctx;
@@ -484,6 +503,10 @@ static struct read_stream_ctx *session_assign_read_stream(struct helper_session 
 	victim->next_offset = req->offset;
 	victim->worker_id = s->read_stream_next_worker++ % HELPER_READ_WORKERS;
 	victim->last_used_ms = now;
+	vlog("read_stream: create stream_id=%llu hint=%u inode=%u off=%llu worker=%u band=%llu",
+	     (unsigned long long)victim->stream_id, req->flags, req->inode,
+	     (unsigned long long)req->offset, victim->worker_id,
+	     (unsigned long long)band);
 	return victim;
 }
 
@@ -3366,18 +3389,28 @@ static int parse_chunk_meta_rsp(uint32_t msgid, const uint8_t *rsp, uint32_t rsp
 	size_t e_sz;
 
 	if (rsp_len == 5) {
-		if (parse_simple_status(msgid, rsp, rsp_len, &status))
+		if (parse_simple_status(msgid, rsp, rsp_len, &status)) {
+			vlog("parse_chunk_meta_rsp: simple status parse failed msgid=%u rsp_len=%u",
+			     msgid, rsp_len);
 			return -EPROTO;
+		}
+		vlog("parse_chunk_meta_rsp: simple status msgid=%u status=%u", msgid, status);
 		return status;
 	}
-	if (parse_msgid(msgid, rsp, rsp_len))
+	if (parse_msgid(msgid, rsp, rsp_len)) {
+		uint32_t got = (rsp_len >= 4) ? get32be(rsp) : 0;
+		vlog("parse_chunk_meta_rsp: msgid mismatch want=%u got=%u rsp_len=%u", msgid, got, rsp_len);
 		return -EPROTO;
+	}
 
 	memset(m, 0, sizeof(*m));
 	p = rsp + 4;
 	end = rsp + rsp_len;
-	if ((size_t)(end - p) < 20)
+	if ((size_t)(end - p) < 20) {
+		vlog("parse_chunk_meta_rsp: short body msgid=%u rsp_len=%u body=%zu",
+		     msgid, rsp_len, (size_t)(end - p));
 		return -EPROTO;
+	}
 
 	if ((end - p) >= 21 && (p[0] >= 1 && p[0] <= 3)) {
 		m->protocol = p[0];
@@ -3414,8 +3447,12 @@ static int parse_chunk_meta_rsp(uint32_t msgid, const uint8_t *rsp, uint32_t rsp
 		m->loc_count++;
 		p += e_sz;
 	}
-	if (m->loc_count == 0)
+	if (m->loc_count == 0) {
+		vlog("parse_chunk_meta_rsp: no replicas msgid=%u protocol=%u rsp_len=%u chunkid=%llu version=%u",
+		     msgid, m->protocol, rsp_len,
+		     (unsigned long long)m->chunkid, m->version);
 		return MFS_ERROR_NOCHUNKSERVERS;
+	}
 	return 0;
 }
 
@@ -3426,20 +3463,25 @@ static int session_read_chunk_meta(struct helper_session *s,
 	uint8_t pkt[4 + 4 + 4 + 1];
 	uint8_t *rsp = NULL;
 	uint32_t rsp_len = 0;
-	uint32_t msgid = next_msgid(s);
+	uint32_t msgid;
 	int ret;
 
+	pthread_mutex_lock(&s->read_chunk_meta_mu);
+	msgid = next_msgid(s);
 	put32be(pkt, msgid);
 	put32be(pkt + 4, inode);
 	put32be(pkt + 8, chunk_idx);
 	pkt[12] = 0;
-
 	ret = master_rpc(s, CLTOMA_FUSE_READ_CHUNK, pkt, sizeof(pkt),
 			 MATOCL_FUSE_READ_CHUNK, &rsp, &rsp_len);
 	if (ret)
-		return ret;
+		goto out_unlock;
 	ret = parse_chunk_meta_rsp(msgid, rsp, rsp_len, m);
+out_unlock:
+	pthread_mutex_unlock(&s->read_chunk_meta_mu);
 	free(rsp);
+	if (ret)
+		return ret;
 	return ret;
 }
 
@@ -3548,6 +3590,8 @@ static int read_state_fetch_one_chunk_meta(struct helper_session *s,
 	int ret;
 
 	if (session_lookup_read_meta_cache(s, inode, chunk_idx, m, &cached_status)) {
+		if (cached_status)
+			vlog("read_meta: cache status inode=%u chunk=%u status=%d", inode, chunk_idx, cached_status);
 		read_state_store_stripe_meta(rs, inode, chunk_idx, cached_status,
 					     cached_status ? NULL : m);
 		return cached_status;
@@ -3555,6 +3599,8 @@ static int read_state_fetch_one_chunk_meta(struct helper_session *s,
 
 	if (!session_acquire_read_meta_fetch(s, inode, chunk_idx) &&
 	    session_lookup_read_meta_cache(s, inode, chunk_idx, m, &cached_status)) {
+		if (cached_status)
+			vlog("read_meta: waited cache status inode=%u chunk=%u status=%d", inode, chunk_idx, cached_status);
 		read_state_store_stripe_meta(rs, inode, chunk_idx, cached_status,
 					     cached_status ? NULL : m);
 		return cached_status;
@@ -3562,6 +3608,7 @@ static int read_state_fetch_one_chunk_meta(struct helper_session *s,
 
 	ret = session_read_chunk_meta(s, inode, chunk_idx, m);
 	if (ret) {
+		vlog("read_meta: fetch failed inode=%u chunk=%u ret=%d", inode, chunk_idx, ret);
 		if (ret == MFS_ERROR_NOCHUNKSERVERS || ret == MFS_ERROR_NOCHUNK) {
 			session_store_read_meta_cache(s, inode, chunk_idx, ret, NULL);
 			read_state_store_stripe_meta(rs, inode, chunk_idx, ret, NULL);
@@ -3618,8 +3665,10 @@ static int read_state_get_chunk_meta(struct helper_session *s,
 	if (rs->meta_valid &&
 	    rs->inode == inode &&
 	    rs->chunk_idx == chunk_idx) {
-		if (rs->meta_status)
+		if (rs->meta_status) {
+			vlog("read_meta: hot status inode=%u chunk=%u status=%d", inode, chunk_idx, rs->meta_status);
 			return rs->meta_status;
+		}
 		*m = rs->meta;
 		return 0;
 	}
@@ -3638,6 +3687,9 @@ static int read_state_get_chunk_meta(struct helper_session *s,
 	rs->inode = inode;
 	rs->chunk_idx = chunk_idx;
 	if (ret) {
+		vlog("read_meta: get failed inode=%u chunk=%u ret=%d stripe_band=%llu",
+		     inode, chunk_idx, ret,
+		     (unsigned long long)rs->stripe_band);
 		memset(&rs->meta, 0, sizeof(rs->meta));
 		return ret;
 	}
@@ -4168,6 +4220,12 @@ static int read_state_fetch_window(struct helper_session *s,
 			int csfd = read_state_get_cs_fd(rs, s, inode, preferred);
 
 			if (csfd >= 0) {
+				vlog("read_fetch: preferred inode=%u chunk=%u chunkid=%llu off=%u len=%u ip=%u port=%u attempt=%u",
+				     inode, chunk_idx,
+				     (unsigned long long)m->chunkid,
+				     chunk_off, attempt_fetch_len,
+				     preferred->ip, preferred->port,
+				     attempt);
 				ret = cs_read_data_on_fd(csfd, m, preferred, chunk_off,
 							 attempt_fetch_len, fetch_buf,
 							 got_out);
@@ -4204,6 +4262,12 @@ static int read_state_fetch_window(struct helper_session *s,
 				continue;
 			}
 
+			vlog("read_fetch: alt inode=%u chunk=%u chunkid=%llu off=%u len=%u ip=%u port=%u attempt=%u",
+			     inode, chunk_idx,
+			     (unsigned long long)m->chunkid,
+			     chunk_off, attempt_fetch_len,
+			     loc->ip, loc->port,
+			     attempt);
 			ret = cs_read_data_on_fd(csfd, m, loc, chunk_off,
 						 attempt_fetch_len, fetch_buf, got_out);
 			if (ret == 0)
@@ -4673,10 +4737,13 @@ static int read_state_read_data(struct helper_session *s,
 		pthread_cond_broadcast(&s->read_prefetch_cv);
 		pthread_mutex_unlock(&s->read_prefetch_mu);
 		if (ret) {
-			vlog("read_data: fetch failed inode=%u band=%llu chunk=%u off=%u fetch_len=%u ret=%d active_reads=%u",
+			vlog("read_data: fetch failed inode=%u hint=%u band=%llu chunk=%u off=%u fetch_len=%u ret=%d active_reads=%u pref=%u:%u cs=%u:%u",
 			     req->inode,
+			     req->flags,
 			     (unsigned long long)mfs_read_band(req->offset),
-			     chunk_idx, fetch_off, fetch_len, ret, active_reads);
+			     chunk_idx, fetch_off, fetch_len, ret, active_reads,
+			     rs->preferred_ip, rs->preferred_port,
+			     rs->cs_ip, rs->cs_port);
 			goto out;
 		}
 		if (got == 0) {
@@ -5330,8 +5397,21 @@ static void *read_worker_thread_main(void *arg)
 			if (!ctx) {
 				status = -ESHUTDOWN;
 			} else {
+				vlog("read_worker: start worker=%u stream_id=%llu hint=%u inode=%u off=%llu size=%u band=%llu",
+				     worker_id,
+				     (unsigned long long)ctx->stream_id,
+				     req->flags, req->inode,
+				     (unsigned long long)req->offset,
+				     req->size,
+				     (unsigned long long)mfs_read_band(req->offset));
 				status = read_state_read_data(s, &ctx->rs, req,
 						&rsp_payload, &rsp_len);
+				vlog("read_worker: done worker=%u stream_id=%llu hint=%u inode=%u off=%llu status=%d rsp_len=%u",
+				     worker_id,
+				     (unsigned long long)ctx->stream_id,
+				     req->flags, req->inode,
+				     (unsigned long long)req->offset,
+				     status, rsp_len);
 			}
 		}
 
