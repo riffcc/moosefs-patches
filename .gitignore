@@ -1,0 +1,33 @@
+# Local analysis/scratch artifacts
+.palace/
+maps/
+*.swp
+*.swo
+
+# Autotools/configure output
+Makefile
+config.h
+config.log
+config.status
+config.h.in~
+configure~
+libtool
+stamp-h1
+autom4te.cache/
+
+# Common build output
+*.o
+*.lo
+*.la
+*.a
+*.so
+*.so.*
+
+# Per-directory build state
+**/.deps/
+**/.libs/
+**/__pycache__/
+**/target/
+
+# Local-only large artifacts
+extended/mfs-direct-rs/ubuntu-24.04.4-live-server-amd64.iso
