@@ -13,6 +13,7 @@ default = []
 quic = ["dep:quinn", "dep:rustls", "dep:tokio"]
 
 [dependencies]
+crc32fast = "1.5"
 memmap2 = "0.9"
 md5 = "0.7"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }

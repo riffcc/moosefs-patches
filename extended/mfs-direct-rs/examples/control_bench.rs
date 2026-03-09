@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use moosefs_direct::{Client, ConnectOptions, PacketModeMaster};
 #[cfg(feature = "quic")]
-use moosefs_direct::QuicStreamMaster;
+use moosefs_direct::{QuicConnectConfig, QuicStreamMaster};
 
 fn usage(program: &str) -> String {
     format!(
@@ -48,7 +48,10 @@ fn main() {
     bench_tcp(master, path, iterations, options.clone());
     bench_packet(master, path, iterations, options.clone());
     #[cfg(feature = "quic")]
-    bench_real_quic(master, path, iterations, options);
+    {
+        bench_real_quic_connect(master, options.quic.clone());
+        bench_real_quic(master, path, iterations, options);
+    }
     #[cfg(not(feature = "quic"))]
     println!("real_quic skipped: build without --features quic");
 }
@@ -70,6 +73,25 @@ fn bench_real_quic(master: &str, path: &str, iterations: usize, options: Connect
     run_bench::<QuicStreamMaster, _>("real_quic", iterations, || {
         Client::<QuicStreamMaster>::connect_registered(master, options.clone())
     }, path);
+}
+
+#[cfg(feature = "quic")]
+fn bench_real_quic_connect(master: &str, quic: QuicConnectConfig) {
+    let start = Instant::now();
+    match QuicStreamMaster::connect(master, &quic) {
+        Ok((_master, hello)) => {
+            println!(
+                "real_quic_handshake connect_ms={:.3} server_version=0x{:06x} flags=0x{:08x} max_datagram={}",
+                millis(start.elapsed()),
+                hello.server_version,
+                hello.flags,
+                hello.max_datagram,
+            );
+        }
+        Err(err) => {
+            println!("real_quic_handshake failed: {err}");
+        }
+    }
 }
 
 fn run_bench<S, F>(label: &str, iterations: usize, connect: F, path: &str)

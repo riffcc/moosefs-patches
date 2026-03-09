@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use memmap2::Mmap;
 use moosefs_direct::{Client, ConnectOptions};
+#[cfg(feature = "quic")]
+use moosefs_direct::QuicStreamMaster;
 
 fn usage(program: &str) -> String {
     format!(
@@ -15,6 +17,9 @@ fn usage(program: &str) -> String {
 }
 
 fn main() {
+    if cfg!(debug_assertions) {
+        eprintln!("warning: running bench in debug mode; throughput numbers are not representative. Prefer `cargo run --release --example bench -- ...`");
+    }
     let args: Vec<String> = env::args().collect();
     if !(args.len() == 4 || args.len() == 5 || args.len() == 6) {
         eprintln!("{}", usage(args.first().map(String::as_str).unwrap_or("bench")));
@@ -46,6 +51,14 @@ fn main() {
         .unwrap_or(options.max_in_flight_write_fragments as u64) as usize;
     let experimental_ooo = env_flag("MFS_OOO_WRITE_ACKS");
     let force_buffered = env_flag("MFS_FORCE_BUFFERED");
+    let transport = env::var("MFS_MASTER_TRANSPORT")
+        .unwrap_or_else(|_| "tcp".to_string())
+        .to_lowercase();
+    let skip_write = env_flag("MFS_SKIP_WRITE");
+    let warmup_iterations = env::var("MFS_WARMUP")
+        .ok()
+        .map(|raw| parse_u64(&raw, "MFS_WARMUP"))
+        .unwrap_or(0) as usize;
     let streaming = if force_buffered {
         false
     } else {
@@ -68,20 +81,65 @@ fn main() {
     } else {
         Some(make_payload(size))
     };
+    let build_mode = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let payload_mode = if streaming {
+        "streaming"
+    } else if source_map.is_some() {
+        "file"
+    } else {
+        "buffered"
+    };
 
     println!(
-        "benchmark master={} path={} size={} bytes iterations={} inflight={} experimental_ooo={} streaming={} force_buffered={} source_file={}",
+        "benchmark master={} path={} size={} bytes iterations={} warmup={} inflight={} experimental_ooo={} build={} payload_mode={} streaming={} force_buffered={} skip_write={} source_file={}",
         master,
         path,
         size,
         iterations,
+        warmup_iterations,
         max_in_flight,
         experimental_ooo,
+        build_mode,
+        payload_mode,
         streaming,
         force_buffered,
+        skip_write,
         source_file.as_deref().unwrap_or("-"),
     );
+    match transport.as_str() {
+        "tcp" => run_bench_tcp(master, path, size, iterations, warmup_iterations, options, streaming, skip_write, source_map.as_deref(), payload.as_deref()),
+        "quic" => {
+            #[cfg(feature = "quic")]
+            run_bench_quic(master, path, size, iterations, warmup_iterations, options, streaming, skip_write, source_map.as_deref(), payload.as_deref());
+            #[cfg(not(feature = "quic"))]
+            {
+                eprintln!("MFS_MASTER_TRANSPORT=quic requires building with --features quic");
+                process::exit(2);
+            }
+        }
+        other => {
+            eprintln!("unsupported MFS_MASTER_TRANSPORT: {other}");
+            process::exit(2);
+        }
+    }
+}
 
+fn run_bench_tcp(
+    master: &str,
+    path: &str,
+    size: usize,
+    iterations: usize,
+    warmup_iterations: usize,
+    options: ConnectOptions,
+    streaming: bool,
+    skip_write: bool,
+    source_map: Option<&[u8]>,
+    payload: Option<&[u8]>,
+) {
     let connect_start = Instant::now();
     let mut client = match Client::<TcpStream>::connect_registered(master, options) {
         Ok(client) => client,
@@ -92,37 +150,127 @@ fn main() {
     };
     let connect_elapsed = connect_start.elapsed();
     println!("connect/register: {:.3} ms", millis(connect_elapsed));
+    drive_bench(
+        &mut client,
+        path,
+        size,
+        iterations,
+        warmup_iterations,
+        streaming,
+        skip_write,
+        source_map,
+        payload,
+    );
+}
+
+#[cfg(feature = "quic")]
+fn run_bench_quic(
+    master: &str,
+    path: &str,
+    size: usize,
+    iterations: usize,
+    warmup_iterations: usize,
+    options: ConnectOptions,
+    streaming: bool,
+    skip_write: bool,
+    source_map: Option<&[u8]>,
+    payload: Option<&[u8]>,
+) {
+    let connect_start = Instant::now();
+    let mut client = match Client::<QuicStreamMaster>::connect_registered(master, options) {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("quic connect/register failed: {err}");
+            process::exit(1);
+        }
+    };
+    let connect_elapsed = connect_start.elapsed();
+    println!("connect/register: {:.3} ms", millis(connect_elapsed));
+    drive_bench(
+        &mut client,
+        path,
+        size,
+        iterations,
+        warmup_iterations,
+        streaming,
+        skip_write,
+        source_map,
+        payload,
+    );
+}
+
+fn drive_bench<S>(
+    client: &mut Client<S>,
+    path: &str,
+    size: usize,
+    iterations: usize,
+    warmup_iterations: usize,
+    streaming: bool,
+    skip_write: bool,
+    source_map: Option<&[u8]>,
+    payload: Option<&[u8]>,
+) where
+    S: Read + std::io::Write,
+    Client<S>: BenchClientOps,
+{
+    for warmup in 0..warmup_iterations {
+        if skip_write {
+            break;
+        }
+        if streaming {
+            let mut reader = PatternReader::new(size as u64);
+            if let Err(err) = client.bench_write_from_reader(path, size as u64, &mut reader) {
+                eprintln!("warmup write failed on iteration {}: {err}", warmup + 1);
+                process::exit(1);
+            }
+        } else if let Some(source_map) = source_map {
+            if let Err(err) = client.bench_write_all(path, source_map) {
+                eprintln!("warmup write failed on iteration {}: {err}", warmup + 1);
+                process::exit(1);
+            }
+        } else if let Some(payload) = payload {
+            if let Err(err) = client.bench_write_all(path, payload) {
+                eprintln!("warmup write failed on iteration {}: {err}", warmup + 1);
+                process::exit(1);
+            }
+        }
+        println!("warmup={} done", warmup + 1);
+    }
 
     let mut write_samples = Vec::with_capacity(iterations);
     let mut read_samples = Vec::with_capacity(iterations);
 
     for iteration in 0..iterations {
-        let write_start = Instant::now();
-        if streaming {
-            let mut reader = PatternReader::new(size as u64);
-            if let Err(err) = client.write_from_reader(path, size as u64, &mut reader) {
-                eprintln!("streaming write failed on iteration {}: {err}", iteration + 1);
-                process::exit(1);
-            }
-        } else if let Some(source_map) = source_map.as_ref() {
-            if let Err(err) = client.write_all(path, source_map.as_ref()) {
-                eprintln!("write failed on iteration {}: {err}", iteration + 1);
-                process::exit(1);
-            }
-        } else if let Some(payload) = payload.as_ref() {
-            if let Err(err) = client.write_all(path, payload) {
-                eprintln!("write failed on iteration {}: {err}", iteration + 1);
-                process::exit(1);
-            }
+        let write_elapsed = if skip_write {
+            Duration::ZERO
+        } else {
+            let write_start = Instant::now();
+            if streaming {
+                let mut reader = PatternReader::new(size as u64);
+                if let Err(err) = client.bench_write_from_reader(path, size as u64, &mut reader) {
+                    eprintln!("streaming write failed on iteration {}: {err}", iteration + 1);
+                    process::exit(1);
+                }
+            } else if let Some(source_map) = source_map {
+                if let Err(err) = client.bench_write_all(path, source_map) {
+                    eprintln!("write failed on iteration {}: {err}", iteration + 1);
+                    process::exit(1);
+                }
+            } else if let Some(payload) = payload {
+                if let Err(err) = client.bench_write_all(path, payload) {
+                    eprintln!("write failed on iteration {}: {err}", iteration + 1);
+                    process::exit(1);
+                }
+            };
+            write_start.elapsed()
         };
-        let write_elapsed = write_start.elapsed();
         write_samples.push(write_elapsed);
 
-        let read_elapsed = if streaming {
+        let read_elapsed = if streaming && !skip_write {
             Duration::ZERO
         } else {
             let read_start = Instant::now();
-            let read_back = match client.read_all(path) {
+            let read_back = match client.bench_read_all(path) {
                 Ok(data) => data,
                 Err(err) => {
                     eprintln!("read failed on iteration {}: {err}", iteration + 1);
@@ -132,13 +280,20 @@ fn main() {
             let read_elapsed = read_start.elapsed();
             read_samples.push(read_elapsed);
 
-            let expected: &[u8] = if let Some(source_map) = source_map.as_ref() {
-                source_map.as_ref()
-            } else {
-                payload.as_ref().unwrap().as_slice()
-            };
-            if read_back != expected {
-                eprintln!("verification failed on iteration {}", iteration + 1);
+            let expected = source_map.or(payload);
+            if let Some(expected) = expected {
+                if read_back != expected {
+                    eprintln!("verification failed on iteration {}", iteration + 1);
+                    process::exit(1);
+                }
+            }
+            if skip_write && read_back.len() != size {
+                eprintln!(
+                    "read length mismatch on iteration {}: expected {} bytes, got {}",
+                    iteration + 1,
+                    size,
+                    read_back.len()
+                );
                 process::exit(1);
             }
             read_elapsed
@@ -171,6 +326,56 @@ fn main() {
             mib_per_sec(size, div_duration(read_total, iterations as u32))
         },
     );
+}
+
+trait BenchClientOps {
+    fn bench_write_all(&mut self, path: &str, bytes: &[u8]) -> moosefs_direct::Result<()>;
+    fn bench_write_from_reader<R: Read>(
+        &mut self,
+        path: &str,
+        size: u64,
+        reader: &mut R,
+    ) -> moosefs_direct::Result<()>;
+    fn bench_read_all(&mut self, path: &str) -> moosefs_direct::Result<Vec<u8>>;
+}
+
+impl BenchClientOps for Client<TcpStream> {
+    fn bench_write_all(&mut self, path: &str, bytes: &[u8]) -> moosefs_direct::Result<()> {
+        self.write_all(path, bytes)
+    }
+
+    fn bench_write_from_reader<R: Read>(
+        &mut self,
+        path: &str,
+        size: u64,
+        reader: &mut R,
+    ) -> moosefs_direct::Result<()> {
+        self.write_from_reader(path, size, reader)
+    }
+
+    fn bench_read_all(&mut self, path: &str) -> moosefs_direct::Result<Vec<u8>> {
+        self.read_all(path)
+    }
+}
+
+#[cfg(feature = "quic")]
+impl BenchClientOps for Client<QuicStreamMaster> {
+    fn bench_write_all(&mut self, path: &str, bytes: &[u8]) -> moosefs_direct::Result<()> {
+        self.write_all(path, bytes)
+    }
+
+    fn bench_write_from_reader<R: Read>(
+        &mut self,
+        path: &str,
+        size: u64,
+        reader: &mut R,
+    ) -> moosefs_direct::Result<()> {
+        self.write_from_reader(path, size, reader)
+    }
+
+    fn bench_read_all(&mut self, path: &str) -> moosefs_direct::Result<Vec<u8>> {
+        self.read_all(path)
+    }
 }
 
 fn parse_u64(raw: &str, field: &str) -> u64 {

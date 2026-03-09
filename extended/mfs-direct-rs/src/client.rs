@@ -1,13 +1,16 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::protocol::{
     attr_size, attr_type, crc32_update, decode_u16_be, decode_u32_be,
     decode_u64_be, expect_msgid, expect_simple_status, read_packet, response_status, roundtrip,
     write_packet, version_int, BLOCK_SIZE, CHUNKOPFLAG_CANMODTIME, CHUNK_SIZE,
-    CLTOMA_FUSE_CREATE, CLTOMA_FUSE_GETATTR, CLTOMA_FUSE_LOOKUP, CLTOMA_FUSE_MKDIR,
+    ANTOAN_NOP, CLTOMA_FUSE_CREATE, CLTOMA_FUSE_GETATTR, CLTOMA_FUSE_LOOKUP, CLTOMA_FUSE_MKDIR,
     CLTOMA_FUSE_OPEN, CLTOMA_FUSE_READDIR, CLTOMA_FUSE_READ_CHUNK, CLTOMA_FUSE_REGISTER,
     CLTOMA_FUSE_RENAME, CLTOMA_FUSE_RMDIR, CLTOMA_FUSE_TRUNCATE, CLTOMA_FUSE_UNLINK,
     CLTOMA_FUSE_WRITE_CHUNK, CLTOMA_FUSE_WRITE_CHUNK_END, CLTOCS_READ, CLTOCS_WRITE,
@@ -23,6 +26,8 @@ use crate::protocol::{
 use crate::quic::{probe_quic_endpoint, PacketModeMaster, QuicConnectConfig};
 #[cfg(feature = "quic")]
 use crate::quic::QuicStreamMaster;
+
+const EDGEID_MAX: u64 = 0x7FFF_FFFF_FFFF_FFFF;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectOptions {
@@ -56,6 +61,17 @@ impl Default for ConnectOptions {
 }
 
 impl ConnectOptions {
+    pub fn with_subdir(mut self, subdir: &str) -> Self {
+        self.subdir = if subdir.is_empty() {
+            "/".to_string()
+        } else if subdir.starts_with('/') {
+            subdir.to_string()
+        } else {
+            format!("/{subdir}")
+        };
+        self
+    }
+
     pub fn with_password(mut self, password: &str) -> Self {
         self.password_md5 = Some(md5::compute(password.as_bytes()).0);
         self
@@ -141,12 +157,66 @@ pub struct OpenFile {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileType {
+    Directory,
+    RegularFile,
+    Symlink,
+    BlockDevice,
+    CharacterDevice,
+    Fifo,
+    Socket,
+    Unknown(u8),
+}
+
+impl FileType {
+    pub fn from_raw(raw: u8) -> Self {
+        match raw {
+            TYPE_DIRECTORY => Self::Directory,
+            TYPE_FILE => Self::RegularFile,
+            3 => Self::Symlink,
+            4 => Self::BlockDevice,
+            5 => Self::CharacterDevice,
+            6 => Self::Fifo,
+            7 => Self::Socket,
+            other => Self::Unknown(other),
+        }
+    }
+
+    pub fn as_raw(self) -> u8 {
+        match self {
+            Self::Directory => TYPE_DIRECTORY,
+            Self::RegularFile => TYPE_FILE,
+            Self::Symlink => 3,
+            Self::BlockDevice => 4,
+            Self::CharacterDevice => 5,
+            Self::Fifo => 6,
+            Self::Socket => 7,
+            Self::Unknown(raw) => raw,
+        }
+    }
+
+    pub fn is_dir(self) -> bool {
+        matches!(self, Self::Directory)
+    }
+
+    pub fn is_file(self) -> bool {
+        matches!(self, Self::RegularFile)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntry {
     pub name: String,
     pub inode: u32,
     pub file_type: u8,
     pub size: u64,
+}
+
+impl DirEntry {
+    pub fn kind(&self) -> FileType {
+        FileType::from_raw(self.file_type)
+    }
 }
 
 pub struct Client<S = TcpStream> {
@@ -225,6 +295,28 @@ impl ConfirmedRanges {
             .iter()
             .any(|range| range.start <= required.start && range.end >= required.end)
     }
+}
+
+fn write_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env::var("MFS_WRITE_TRACE")
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn trace_write_line(message: impl FnOnce() -> String) {
+    if write_trace_enabled() {
+        eprintln!("[mfs-write-trace] {}", message());
+    }
+}
+
+fn trace_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 impl Client<TcpStream> {
@@ -307,7 +399,12 @@ impl Client<TcpStream> {
 
     pub fn write_from_reader<R: Read>(&mut self, path: &str, size: u64, reader: &mut R) -> Result<()> {
         validate_absolute_path(path)?;
-        let inode = self.ensure_file(path, size)?;
+        let write_started = Instant::now();
+        let inode = self.ensure_file(path, size)? as u32;
+        self.read_chunk_cache.retain(|(cached_inode, _), _| *cached_inode != inode);
+        self.write_chunk_cache
+            .retain(|(cached_inode, _), _| *cached_inode != inode);
+        self.read_session = None;
         if size == 0 {
             return Ok(());
         }
@@ -321,6 +418,11 @@ impl Client<TcpStream> {
         let mut chunk_session = None;
         let mut prefetched_chunk = None;
         let mut prefetch_client = self.spawn_prefetch_client().ok();
+        let mut chunk_buf = vec![0u8; (CHUNK_SIZE as usize).min(size.max(1) as usize)];
+        let mut total_chunk_lookup = Duration::ZERO;
+        let mut total_chunk_write = Duration::ZERO;
+        let mut total_chunk_finalize = Duration::ZERO;
+        let mut chunk_count = 0usize;
 
         while written < size {
             let file_offset = written;
@@ -328,28 +430,42 @@ impl Client<TcpStream> {
             let chunk_offset = (file_offset % CHUNK_SIZE) as u32;
             let remaining = (size - written) as usize;
             let to_write = remaining.min((CHUNK_SIZE as usize) - (chunk_offset as usize));
-            let mut chunk_buf = vec![0u8; to_write];
-            reader.read_exact(&mut chunk_buf)?;
+            reader.read_exact(&mut chunk_buf[..to_write])?;
+            let chunk_slice = &chunk_buf[..to_write];
 
+            let chunk_lookup_started = Instant::now();
             let chunk_location = match prefetched_chunk.take() {
                 Some(chunk) => chunk,
-                None => self.master_write_chunk(inode as u32, chunk_index)?,
+                None => self.master_write_chunk(inode, chunk_index)?,
             };
+            total_chunk_lookup += chunk_lookup_started.elapsed();
             let has_next_chunk = written + (to_write as u64) < size;
+            let chunk_write_started = Instant::now();
             if has_next_chunk {
                 let next_chunk_index = chunk_index + 1;
                 if let Some(prefetch) = prefetch_client.as_mut() {
                     prefetched_chunk = Some(std::thread::scope(|scope| -> Result<ChunkLocation> {
                         let handle =
-                            scope.spawn(|| prefetch.master_write_chunk(inode as u32, next_chunk_index));
+                            scope.spawn(|| prefetch.master_write_chunk(inode, next_chunk_index));
                         self.chunkserver_write(
                             &chunk_location,
                             chunk_offset,
-                            &chunk_buf,
+                            chunk_slice,
                             &mut chunk_session,
                         )?;
+                        let prefetch_wait_started = Instant::now();
                         match handle.join() {
-                            Ok(result) => result,
+                            Ok(result) => {
+                                trace_write_line(|| {
+                                    format!(
+                                        "prefetch_join_wait chunk={} next_chunk={} wait_ms={:.3}",
+                                        chunk_index,
+                                        next_chunk_index,
+                                        trace_ms(prefetch_wait_started.elapsed()),
+                                    )
+                                });
+                                result
+                            }
                             Err(_) => Err(Error::Protocol("prefetch worker panicked")),
                         }
                     })?);
@@ -357,32 +473,49 @@ impl Client<TcpStream> {
                     self.chunkserver_write(
                         &chunk_location,
                         chunk_offset,
-                        &chunk_buf,
+                        chunk_slice,
                         &mut chunk_session,
                     )?;
-                    prefetched_chunk = Some(self.master_write_chunk(inode as u32, next_chunk_index)?);
+                    prefetched_chunk = Some(self.master_write_chunk(inode, next_chunk_index)?);
                 }
             } else {
                 self.chunkserver_write(
                     &chunk_location,
                     chunk_offset,
-                    &chunk_buf,
+                    chunk_slice,
                     &mut chunk_session,
                 )?;
             }
+            total_chunk_write += chunk_write_started.elapsed();
 
+            let finalize_started = Instant::now();
             self.master_write_chunk_end(
                 master_version,
-                inode as u32,
+                inode,
                 chunk_index,
                 chunk_location.chunk_id,
                 size,
                 chunk_offset,
                 to_write as u32,
             )?;
+            total_chunk_finalize += finalize_started.elapsed();
+            chunk_count += 1;
 
             written += to_write as u64;
         }
+
+        trace_write_line(|| {
+            format!(
+                "write_from_reader path={} size={} bytes chunks={} total_ms={:.3} lookup_ms={:.3} chunk_write_ms={:.3} finalize_ms={:.3}",
+                path,
+                size,
+                chunk_count,
+                trace_ms(write_started.elapsed()),
+                trace_ms(total_chunk_lookup),
+                trace_ms(total_chunk_write),
+                trace_ms(total_chunk_finalize),
+            )
+        });
 
         Ok(())
     }
@@ -476,6 +609,7 @@ impl Client<TcpStream> {
             )?;
             written += to_write;
         }
+        self.read_session = None;
 
         Ok(())
     }
@@ -579,7 +713,11 @@ impl Client<QuicStreamMaster> {
 
     pub fn write_from_reader<R: Read>(&mut self, path: &str, size: u64, reader: &mut R) -> Result<()> {
         validate_absolute_path(path)?;
-        let inode = self.ensure_file(path, size)?;
+        let inode = self.ensure_file(path, size)? as u32;
+        self.read_chunk_cache.retain(|(cached_inode, _), _| *cached_inode != inode);
+        self.write_chunk_cache
+            .retain(|(cached_inode, _), _| *cached_inode != inode);
+        self.read_session = None;
         if size == 0 {
             return Ok(());
         }
@@ -591,6 +729,7 @@ impl Client<QuicStreamMaster> {
             .master_version;
         let mut written = 0u64;
         let mut chunk_session = None;
+        let mut chunk_buf = vec![0u8; (CHUNK_SIZE as usize).min(size.max(1) as usize)];
 
         while written < size {
             let file_offset = written;
@@ -598,19 +737,19 @@ impl Client<QuicStreamMaster> {
             let chunk_offset = (file_offset % CHUNK_SIZE) as u32;
             let remaining = (size - written) as usize;
             let to_write = remaining.min((CHUNK_SIZE as usize) - (chunk_offset as usize));
-            let mut chunk_buf = vec![0u8; to_write];
-            reader.read_exact(&mut chunk_buf)?;
+            reader.read_exact(&mut chunk_buf[..to_write])?;
+            let chunk_slice = &chunk_buf[..to_write];
 
-            let chunk_location = self.master_write_chunk(inode as u32, chunk_index)?;
+            let chunk_location = self.master_write_chunk(inode, chunk_index)?;
             self.chunkserver_write(
                 &chunk_location,
                 chunk_offset,
-                &chunk_buf,
+                chunk_slice,
                 &mut chunk_session,
             )?;
             self.master_write_chunk_end(
                 master_version,
-                inode as u32,
+                inode,
                 chunk_index,
                 chunk_location.chunk_id,
                 size,
@@ -713,6 +852,7 @@ impl Client<QuicStreamMaster> {
             )?;
             written += to_write;
         }
+        self.read_session = None;
 
         Ok(())
     }
@@ -767,6 +907,11 @@ impl Client<QuicStreamMaster> {
         let mut total = 0usize;
         while total < out.len() {
             let packet = read_packet(stream)?;
+            if packet.packet_type == ANTOAN_NOP
+                && (packet.payload.is_empty() || packet.payload == 0u32.to_be_bytes())
+            {
+                continue;
+            }
             if packet.packet_type == CSTOCL_READ_STATUS {
                 if packet.payload.len() < 9 {
                     return Err(Error::Protocol("short read status"));
@@ -777,6 +922,11 @@ impl Client<QuicStreamMaster> {
                         op: "chunkserver read",
                         status,
                     });
+                }
+                if total < out.len() {
+                    return Err(Error::Protocol(
+                        "chunkserver read completed before requested bytes were received",
+                    ));
                 }
                 return Ok(());
             }
@@ -809,6 +959,11 @@ impl Client<QuicStreamMaster> {
 
         loop {
             let packet = read_packet(stream)?;
+            if packet.packet_type == ANTOAN_NOP
+                && (packet.payload.is_empty() || packet.payload == 0u32.to_be_bytes())
+            {
+                continue;
+            }
             if packet.packet_type != CSTOCL_READ_STATUS {
                 continue;
             }
@@ -833,6 +988,7 @@ impl Client<QuicStreamMaster> {
         bytes: &[u8],
         session: &mut Option<ChunkWriteSession>,
     ) -> Result<()> {
+        let total_started = Instant::now();
         let replica = chunk
             .replicas
             .first()
@@ -855,6 +1011,7 @@ impl Client<QuicStreamMaster> {
             start.extend_from_slice(&ip.to_be_bytes());
             start.extend_from_slice(&next_replica.port.to_be_bytes());
         }
+        let init_started = Instant::now();
         write_packet(stream, CLTOCS_WRITE, &start)?;
         let init_status = recv_write_status(stream, chunk.chunk_id)?;
         if init_status.write_id != 0 {
@@ -863,6 +1020,7 @@ impl Client<QuicStreamMaster> {
                 init_status.write_id
             )));
         }
+        let init_elapsed = init_started.elapsed();
 
         let mut sent = 0usize;
         let mut write_id = 1u32;
@@ -870,6 +1028,10 @@ impl Client<QuicStreamMaster> {
         let mut confirmed = ConfirmedRanges::default();
         let required = ByteRange::new(chunk_offset, chunk_offset + bytes.len() as u32);
         let max_in_flight = self.max_in_flight_write_fragments.max(1);
+        let mut send_elapsed = Duration::ZERO;
+        let mut ack_elapsed = Duration::ZERO;
+        let mut ack_count = 0usize;
+        let mut max_observed_in_flight = 0usize;
         while sent < bytes.len() || !in_flight.is_empty() {
             while sent < bytes.len() && in_flight.len() < max_in_flight {
                 let off = chunk_offset + sent as u32;
@@ -878,17 +1040,18 @@ impl Client<QuicStreamMaster> {
                 let frag = (bytes.len() - sent).min((BLOCK_SIZE - block_offset as u32) as usize);
                 let fragment = &bytes[sent..sent + frag];
 
-                let mut payload = Vec::with_capacity(24 + frag);
-                payload.extend_from_slice(&chunk.chunk_id.to_be_bytes());
-                payload.extend_from_slice(&write_id.to_be_bytes());
-                payload.extend_from_slice(&block.to_be_bytes());
-                payload.extend_from_slice(&block_offset.to_be_bytes());
-                payload.extend_from_slice(&(frag as u32).to_be_bytes());
-                payload.extend_from_slice(&crc32_update(0, fragment).to_be_bytes());
-                payload.extend_from_slice(fragment);
-
-                write_packet(stream, CLTOCS_WRITE_DATA, &payload)?;
+                let send_started = Instant::now();
+                write_chunk_data_packet(
+                    stream,
+                    chunk.chunk_id,
+                    write_id,
+                    block,
+                    block_offset,
+                    fragment,
+                )?;
+                send_elapsed += send_started.elapsed();
                 in_flight.insert(write_id, ByteRange::new(off, off + frag as u32));
+                max_observed_in_flight = max_observed_in_flight.max(in_flight.len());
                 sent += frag;
                 write_id = write_id.wrapping_add(1);
             }
@@ -897,7 +1060,10 @@ impl Client<QuicStreamMaster> {
                 continue;
             }
 
+            let ack_started = Instant::now();
             let status = recv_write_status(stream, chunk.chunk_id)?;
+            ack_elapsed += ack_started.elapsed();
+            ack_count += 1;
             if status.write_id == 0 {
                 return Err(Error::Protocol("unexpected extra initial write status"));
             }
@@ -917,7 +1083,26 @@ impl Client<QuicStreamMaster> {
         let mut finish = Vec::with_capacity(12);
         finish.extend_from_slice(&chunk.chunk_id.to_be_bytes());
         finish.extend_from_slice(&chunk.chunk_version.to_be_bytes());
+        let finish_started = Instant::now();
         write_packet(stream, CLTOCS_WRITE_FINISH, &finish)?;
+        let finish_elapsed = finish_started.elapsed();
+        trace_write_line(|| {
+            format!(
+                "chunkserver_write chunk={} replica={}:{} bytes={} offset={} init_ms={:.3} send_ms={:.3} ack_ms={:.3} finish_ms={:.3} total_ms={:.3} ack_count={} max_in_flight={}",
+                chunk.chunk_id,
+                replica.host,
+                replica.port,
+                bytes.len(),
+                chunk_offset,
+                trace_ms(init_elapsed),
+                trace_ms(send_elapsed),
+                trace_ms(ack_elapsed),
+                trace_ms(finish_elapsed),
+                trace_ms(total_started.elapsed()),
+                ack_count,
+                max_observed_in_flight,
+            )
+        });
         Ok(())
     }
 }
@@ -1327,7 +1512,7 @@ impl<S: Read + Write> Client<S> {
         }
 
         let msgid = self.session_mut()?.next_msgid();
-        let mut payload = Vec::with_capacity(21 + leaf.len());
+        let mut payload = Vec::with_capacity(25 + leaf.len());
         payload.extend_from_slice(&msgid.to_be_bytes());
         payload.extend_from_slice(&(parent_inode as u32).to_be_bytes());
         payload.push(leaf.len() as u8);
@@ -1367,7 +1552,7 @@ impl<S: Read + Write> Client<S> {
         }
 
         let msgid = self.session_mut()?.next_msgid();
-        let mut payload = Vec::with_capacity(22 + leaf.len());
+        let mut payload = Vec::with_capacity(26 + leaf.len());
         payload.extend_from_slice(&msgid.to_be_bytes());
         payload.extend_from_slice(&parent_inode.to_be_bytes());
         payload.push(leaf.len() as u8);
@@ -1493,34 +1678,6 @@ impl<S: Read + Write> Client<S> {
     }
 
     fn readdir(&mut self, inode: u32) -> Result<Vec<DirEntry>> {
-        let msgid = self.session_mut()?.next_msgid();
-        let mut payload = Vec::with_capacity(33);
-        payload.extend_from_slice(&msgid.to_be_bytes());
-        payload.extend_from_slice(&inode.to_be_bytes());
-        payload.extend_from_slice(&0u32.to_be_bytes());
-        payload.extend_from_slice(&1u32.to_be_bytes());
-        payload.extend_from_slice(&0u32.to_be_bytes());
-        payload.push(GETDIR_FLAG_WITHATTR);
-        payload.extend_from_slice(&100_000u32.to_be_bytes());
-        payload.extend_from_slice(&0u64.to_be_bytes());
-
-        let packet = roundtrip(
-            &mut self.master,
-            CLTOMA_FUSE_READDIR,
-            &payload,
-            MATOCL_FUSE_READDIR,
-        )?;
-        expect_msgid(&packet, msgid)?;
-        if packet.payload.len() == 5 {
-            return Err(Error::MoosefsStatus {
-                op: "readdir",
-                status: packet.payload[4],
-            });
-        }
-        if packet.payload.len() < 12 {
-            return Err(Error::Protocol("short readdir reply"));
-        }
-
         let master_version = self
             .session
             .as_ref()
@@ -1534,10 +1691,52 @@ impl<S: Read + Write> Client<S> {
         } else {
             35
         };
+        let mut all_entries = Vec::new();
+        let mut edgeid = 0u64;
 
-        match parse_readdir_entries(&packet.payload[12..], attr_len) {
-            Ok(entries) => Ok(entries),
-            Err(_) => parse_readdir_entries(&packet.payload[4..], attr_len),
+        loop {
+            let msgid = self.session_mut()?.next_msgid();
+            let mut payload = Vec::with_capacity(33);
+            payload.extend_from_slice(&msgid.to_be_bytes());
+            payload.extend_from_slice(&inode.to_be_bytes());
+            payload.extend_from_slice(&0u32.to_be_bytes());
+            payload.extend_from_slice(&1u32.to_be_bytes());
+            payload.extend_from_slice(&0u32.to_be_bytes());
+            payload.push(GETDIR_FLAG_WITHATTR);
+            payload.extend_from_slice(&10_000u32.to_be_bytes());
+            payload.extend_from_slice(&edgeid.to_be_bytes());
+
+            let packet = roundtrip(
+                &mut self.master,
+                CLTOMA_FUSE_READDIR,
+                &payload,
+                MATOCL_FUSE_READDIR,
+            )?;
+            expect_msgid(&packet, msgid)?;
+            if packet.payload.len() == 5 {
+                return Err(Error::MoosefsStatus {
+                    op: "readdir",
+                    status: packet.payload[4],
+                });
+            }
+            if packet.payload.len() < 12 {
+                return Err(Error::Protocol("short readdir reply"));
+            }
+
+            let next_edgeid = decode_u64_be(&packet.payload[4..12])?;
+            let entries = match parse_readdir_entries(&packet.payload[12..], attr_len) {
+                Ok(entries) => entries,
+                Err(_) => parse_readdir_entries(&packet.payload[4..], attr_len)?,
+            };
+            all_entries.extend(entries);
+
+            if next_edgeid == EDGEID_MAX {
+                return Ok(all_entries);
+            }
+            if next_edgeid == edgeid {
+                return Err(Error::Protocol("readdir pagination did not advance edge cursor"));
+            }
+            edgeid = next_edgeid;
         }
     }
 
@@ -1590,6 +1789,7 @@ impl<S: Read + Write> Client<S> {
     }
 
     fn master_write_chunk(&mut self, inode: u32, chunk_index: u32) -> Result<ChunkLocation> {
+        let started = Instant::now();
         let master_version = self
             .session
             .as_ref()
@@ -1610,7 +1810,18 @@ impl<S: Read + Write> Client<S> {
             &payload,
             MATOCL_FUSE_WRITE_CHUNK,
         )?;
-        decode_chunk_location(&packet, msgid, chunk_index)
+        let chunk = decode_chunk_location(&packet, msgid, chunk_index)?;
+        trace_write_line(|| {
+            format!(
+                "master_write_chunk inode={} chunk_index={} chunk_id={} replicas={} elapsed_ms={:.3}",
+                inode,
+                chunk_index,
+                chunk.chunk_id,
+                chunk.replicas.len(),
+                trace_ms(started.elapsed()),
+            )
+        });
+        Ok(chunk)
     }
 
     fn master_read_chunk(&mut self, inode: u32, chunk_index: u32) -> Result<ChunkLocation> {
@@ -1705,6 +1916,11 @@ impl Client<TcpStream> {
         let mut total = 0usize;
         while total < out.len() {
             let packet = read_packet(stream)?;
+            if packet.packet_type == ANTOAN_NOP
+                && (packet.payload.is_empty() || packet.payload == 0u32.to_be_bytes())
+            {
+                continue;
+            }
             if packet.packet_type == CSTOCL_READ_STATUS {
                 if packet.payload.len() < 9 {
                     return Err(Error::Protocol("short read status"));
@@ -1715,6 +1931,11 @@ impl Client<TcpStream> {
                         op: "chunkserver read",
                         status,
                     });
+                }
+                if total < out.len() {
+                    return Err(Error::Protocol(
+                        "chunkserver read completed before requested bytes were received",
+                    ));
                 }
                 return Ok(());
             }
@@ -1747,6 +1968,11 @@ impl Client<TcpStream> {
 
         loop {
             let packet = read_packet(stream)?;
+            if packet.packet_type == ANTOAN_NOP
+                && (packet.payload.is_empty() || packet.payload == 0u32.to_be_bytes())
+            {
+                continue;
+            }
             if packet.packet_type != CSTOCL_READ_STATUS {
                 continue;
             }
@@ -1771,6 +1997,7 @@ impl Client<TcpStream> {
         bytes: &[u8],
         session: &mut Option<ChunkWriteSession>,
     ) -> Result<()> {
+        let total_started = Instant::now();
         let replica = chunk
             .replicas
             .first()
@@ -1793,6 +2020,7 @@ impl Client<TcpStream> {
             start.extend_from_slice(&ip.to_be_bytes());
             start.extend_from_slice(&next_replica.port.to_be_bytes());
         }
+        let init_started = Instant::now();
         write_packet(stream, CLTOCS_WRITE, &start)?;
         let init_status = recv_write_status(stream, chunk.chunk_id)?;
         if init_status.write_id != 0 {
@@ -1801,6 +2029,7 @@ impl Client<TcpStream> {
                 init_status.write_id
             )));
         }
+        let init_elapsed = init_started.elapsed();
 
         let mut sent = 0usize;
         let mut write_id = 1u32;
@@ -1808,6 +2037,10 @@ impl Client<TcpStream> {
         let mut confirmed = ConfirmedRanges::default();
         let required = ByteRange::new(chunk_offset, chunk_offset + bytes.len() as u32);
         let max_in_flight = self.max_in_flight_write_fragments.max(1);
+        let mut send_elapsed = Duration::ZERO;
+        let mut ack_elapsed = Duration::ZERO;
+        let mut ack_count = 0usize;
+        let mut max_observed_in_flight = 0usize;
         while sent < bytes.len() || !in_flight.is_empty() {
             while sent < bytes.len() && in_flight.len() < max_in_flight {
                 let off = chunk_offset + sent as u32;
@@ -1816,17 +2049,18 @@ impl Client<TcpStream> {
                 let frag = (bytes.len() - sent).min((BLOCK_SIZE - block_offset as u32) as usize);
                 let fragment = &bytes[sent..sent + frag];
 
-                let mut payload = Vec::with_capacity(24 + frag);
-                payload.extend_from_slice(&chunk.chunk_id.to_be_bytes());
-                payload.extend_from_slice(&write_id.to_be_bytes());
-                payload.extend_from_slice(&block.to_be_bytes());
-                payload.extend_from_slice(&block_offset.to_be_bytes());
-                payload.extend_from_slice(&(frag as u32).to_be_bytes());
-                payload.extend_from_slice(&crc32_update(0, fragment).to_be_bytes());
-                payload.extend_from_slice(fragment);
-
-                write_packet(stream, CLTOCS_WRITE_DATA, &payload)?;
+                let send_started = Instant::now();
+                write_chunk_data_packet(
+                    stream,
+                    chunk.chunk_id,
+                    write_id,
+                    block,
+                    block_offset,
+                    fragment,
+                )?;
+                send_elapsed += send_started.elapsed();
                 in_flight.insert(write_id, ByteRange::new(off, off + frag as u32));
+                max_observed_in_flight = max_observed_in_flight.max(in_flight.len());
                 sent += frag;
                 write_id = write_id.wrapping_add(1);
             }
@@ -1835,7 +2069,10 @@ impl Client<TcpStream> {
                 continue;
             }
 
+            let ack_started = Instant::now();
             let status = recv_write_status(stream, chunk.chunk_id)?;
+            ack_elapsed += ack_started.elapsed();
+            ack_count += 1;
             if status.write_id == 0 {
                 return Err(Error::Protocol("unexpected extra initial write status"));
             }
@@ -1855,7 +2092,26 @@ impl Client<TcpStream> {
         let mut finish = Vec::with_capacity(12);
         finish.extend_from_slice(&chunk.chunk_id.to_be_bytes());
         finish.extend_from_slice(&chunk.chunk_version.to_be_bytes());
+        let finish_started = Instant::now();
         write_packet(stream, CLTOCS_WRITE_FINISH, &finish)?;
+        let finish_elapsed = finish_started.elapsed();
+        trace_write_line(|| {
+            format!(
+                "chunkserver_write chunk={} replica={}:{} bytes={} offset={} init_ms={:.3} send_ms={:.3} ack_ms={:.3} finish_ms={:.3} total_ms={:.3} ack_count={} max_in_flight={}",
+                chunk.chunk_id,
+                replica.host,
+                replica.port,
+                bytes.len(),
+                chunk_offset,
+                trace_ms(init_elapsed),
+                trace_ms(send_elapsed),
+                trace_ms(ack_elapsed),
+                trace_ms(finish_elapsed),
+                trace_ms(total_started.elapsed()),
+                ack_count,
+                max_observed_in_flight,
+            )
+        });
         Ok(())
     }
 }
@@ -2123,6 +2379,31 @@ fn recv_write_status(stream: &mut TcpStream, chunk_id: u64) -> Result<WriteStatu
         }
         return Ok(WriteStatus { write_id });
     }
+}
+
+fn write_chunk_data_packet(
+    stream: &mut TcpStream,
+    chunk_id: u64,
+    write_id: u32,
+    block: u16,
+    block_offset: u16,
+    fragment: &[u8],
+) -> Result<()> {
+    let packet_type = CLTOCS_WRITE_DATA.to_be_bytes();
+    let payload_len = (24 + fragment.len() as u32).to_be_bytes();
+    let mut header = [0u8; 24];
+    header[0..8].copy_from_slice(&chunk_id.to_be_bytes());
+    header[8..12].copy_from_slice(&write_id.to_be_bytes());
+    header[12..14].copy_from_slice(&block.to_be_bytes());
+    header[14..16].copy_from_slice(&block_offset.to_be_bytes());
+    header[16..20].copy_from_slice(&(fragment.len() as u32).to_be_bytes());
+    header[20..24].copy_from_slice(&crc32_update(0, fragment).to_be_bytes());
+    stream.write_all(&packet_type)?;
+    stream.write_all(&payload_len)?;
+    stream.write_all(&header)?;
+    stream.write_all(fragment)?;
+    stream.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]

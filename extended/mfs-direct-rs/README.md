@@ -123,3 +123,15 @@ There is now an experimental feature-gated QUIC path:
 
 This is still experimental and should not be treated as the stable default
 transport yet.
+
+## Benchmarking Notes
+
+For throughput numbers, prefer release builds and make sure you understand
+whether the bench is measuring MooseFS I/O or payload generation overhead.
+
+- Use `cargo run --release --example bench -- ...` for any serious result.
+- For the cleanest write-path number, use `MFS_FORCE_BUFFERED=1`.
+- The default large-file path may stream generated payload data, which can
+  measure benchmark-side CPU work as much as MooseFS throughput.
+- `MFS_INFLIGHT=16` is currently the best tested default for the direct TCP
+  write path on this repo's local NVMe-backed cluster.

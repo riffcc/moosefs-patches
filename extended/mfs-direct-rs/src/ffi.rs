@@ -95,8 +95,15 @@ pub extern "C" fn mfs_client_connect(
             options = options.with_password(password);
         }
 
-        let client = Client::<TcpStream>::connect_registered(master_addr, options).ok()?;
-        Some(Box::into_raw(Box::new(MfsClientHandle::new(client))))
+        match Client::<TcpStream>::connect_registered(master_addr, options) {
+            Ok(client) => Some(Box::into_raw(Box::new(MfsClientHandle::new(client)))),
+            Err(err) => {
+                eprintln!(
+                    "mfs_client_connect failed: master_addr={master_addr} subdir={subdir} error={err}"
+                );
+                None
+            }
+        }
     }));
 
     match result {

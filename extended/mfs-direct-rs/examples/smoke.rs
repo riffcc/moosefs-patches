@@ -34,6 +34,9 @@ fn main() {
         Some(password) => ConnectOptions::default().with_password(password),
         None => ConnectOptions::default(),
     };
+    if let Ok(subdir) = env::var("MFS_SUBDIR") {
+        options = options.with_subdir(&subdir);
+    }
     if let Ok(raw) = env::var("MFS_INFLIGHT") {
         let inflight = raw.parse::<usize>().unwrap_or(1).max(1);
         options = options.with_max_in_flight_write_fragments(inflight);

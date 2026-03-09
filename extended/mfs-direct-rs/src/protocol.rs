@@ -127,7 +127,9 @@ pub fn roundtrip<S: Read + Write>(
     write_packet(stream, request_type, payload)?;
     loop {
         let packet = read_packet(stream)?;
-        if packet.packet_type == ANTOAN_NOP && packet.payload.is_empty() {
+        if packet.packet_type == ANTOAN_NOP
+            && (packet.payload.is_empty() || packet.payload == 0u32.to_be_bytes())
+        {
             continue;
         }
         if packet.packet_type != expected_response_type {
@@ -248,22 +250,16 @@ pub fn attr_record_len(attr: &[u8]) -> usize {
 }
 
 pub fn crc32_update(seed: u32, data: &[u8]) -> u32 {
-    let mut crc = !seed;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg() & 0xEDB8_8320;
-            crc = (crc >> 1) ^ mask;
-        }
-    }
-    !crc
+    let mut hasher = crc32fast::Hasher::new_with_initial(seed);
+    hasher.update(data);
+    hasher.finalize()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         attr_record_len, attr_size, attr_type, crc32_update, decode_u32_be, read_packet,
-        write_packet, Packet,
+        roundtrip, write_packet, Packet, ANTOAN_NOP,
     };
     use std::io::Cursor;
 
@@ -275,6 +271,51 @@ mod tests {
         assert_eq!(decode_u32_be(&buf[4..8]).unwrap(), 2);
         let packet = read_packet(&mut Cursor::new(buf)).unwrap();
         assert_eq!(packet, Packet::new(0x0102_0304, vec![0xaa, 0xbb]));
+    }
+
+    #[test]
+    fn roundtrip_skips_nop_with_zero_msgid_payload() {
+        struct MockStream {
+            read: Cursor<Vec<u8>>,
+            written: Vec<u8>,
+        }
+
+        impl std::io::Read for MockStream {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.read.read(buf)
+            }
+        }
+
+        impl std::io::Write for MockStream {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let request_type = 0x1111_1111;
+        let expected_response_type = 0x2222_2222;
+        let request_payload = [0xaa, 0xbb, 0xcc];
+        let response_payload = [0, 0, 0, 7, 0xdd];
+
+        let mut wire = Vec::new();
+        write_packet(&mut wire, ANTOAN_NOP, &0u32.to_be_bytes()).unwrap();
+        write_packet(&mut wire, expected_response_type, &response_payload).unwrap();
+
+        let mut stream = MockStream {
+            read: Cursor::new(wire),
+            written: Vec::new(),
+        };
+        let packet = roundtrip(&mut stream, request_type, &request_payload, expected_response_type).unwrap();
+
+        let mut expected_write = Vec::new();
+        write_packet(&mut expected_write, request_type, &request_payload).unwrap();
+        assert_eq!(stream.written, expected_write);
+        assert_eq!(packet, Packet::new(expected_response_type, response_payload.to_vec()));
     }
 
     #[test]

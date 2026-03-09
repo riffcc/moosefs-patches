@@ -54,6 +54,9 @@ fn main() {
         Some(password) => ConnectOptions::default().with_password(password),
         None => ConnectOptions::default(),
     };
+    if let Ok(subdir) = env::var("MFS_SUBDIR") {
+        options = options.with_subdir(&subdir);
+    }
     options = options
         .with_max_in_flight_write_fragments(max_in_flight)
         .with_experimental_ooo_write_acks(experimental_ooo);
