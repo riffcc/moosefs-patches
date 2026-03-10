@@ -248,14 +248,16 @@ int mfsblk_proto_parse_register_rsp(const u8 *payload, size_t payload_sz,
 int mfsblk_proto_build_lookup_path_req(u8 *packet, size_t packet_sz, u32 msgid,
 				       const char *path);
 int mfsblk_proto_build_simple_lookup_req(u8 *packet, size_t packet_sz,
-					 u32 parent_inode, const char *name);
+					 u32 msgid, u32 parent_inode,
+					 const char *name);
 int mfsblk_proto_parse_lookup_path_rsp(const u8 *payload, size_t payload_sz,
 				       u32 expected_msgid, u32 *parent_inode,
 				       u32 *inode, char *name, size_t name_sz,
 				       size_t *name_len, u8 *attr,
 				       size_t attr_sz);
 int mfsblk_proto_parse_simple_lookup_rsp(const u8 *payload, size_t payload_sz,
-					 u32 *inode, u8 *attr, size_t attr_sz);
+					 u32 expected_msgid, u32 *inode,
+					 u8 *attr, size_t attr_sz);
 int mfsblk_proto_build_create_path_req(u8 *packet, size_t packet_sz, u32 msgid,
 				       u32 parent_inode, const char *name);
 int mfsblk_proto_parse_create_path_rsp(const u8 *payload, size_t payload_sz,

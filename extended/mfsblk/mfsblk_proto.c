@@ -221,18 +221,21 @@ int mfsblk_proto_build_lookup_path_req(u8 *packet, size_t packet_sz, u32 msgid,
 }
 
 int mfsblk_proto_build_simple_lookup_req(u8 *packet, size_t packet_sz,
-					 u32 parent_inode, const char *name)
+					 u32 msgid, u32 parent_inode,
+					 const char *name)
 {
 	size_t name_len = strlen(name);
 	u8 *p = packet;
 
 	if (!name_len || name_len > 255)
 		return -EINVAL;
-	if (mfsblk_check_buf(8 + 13 + name_len, packet_sz))
+	if (mfsblk_check_buf(8 + 17 + name_len, packet_sz))
 		return -EMSGSIZE;
 
-	mfsblk_proto_build_header(p, MFSBLK_CLTOMA_FUSE_LOOKUP, 13 + name_len);
+	mfsblk_proto_build_header(p, MFSBLK_CLTOMA_FUSE_LOOKUP, 17 + name_len);
 	p += 8;
+	put_unaligned_be32(msgid, p);
+	p += 4;
 	put_unaligned_be32(parent_inode, p);
 	p += 4;
 	*p++ = (u8)name_len;
@@ -242,7 +245,7 @@ int mfsblk_proto_build_simple_lookup_req(u8 *packet, size_t packet_sz,
 	p += 4;
 	put_unaligned_be32(0xFFFFFFFFU, p); /* no gids */
 
-	return 8 + 13 + name_len;
+	return 8 + 17 + name_len;
 }
 
 int mfsblk_proto_parse_lookup_path_rsp(const u8 *payload, size_t payload_sz,
@@ -291,14 +294,19 @@ int mfsblk_proto_parse_lookup_path_rsp(const u8 *payload, size_t payload_sz,
 }
 
 int mfsblk_proto_parse_simple_lookup_rsp(const u8 *payload, size_t payload_sz,
-					 u32 *inode, u8 *attr, size_t attr_sz)
+					 u32 expected_msgid, u32 *inode,
+					 u8 *attr, size_t attr_sz)
 {
 	size_t reply_attr_sz;
 
 	if (!inode || !attr)
 		return -EINVAL;
-	if (payload_sz < 1)
+	if (payload_sz < 5)
 		return -EPROTO;
+	if (get_unaligned_be32(payload) != expected_msgid)
+		return -EPROTO;
+	payload += 4;
+	payload_sz -= 4;
 	if (payload_sz == 1)
 		return mfsblk_proto_status_to_errno(payload[0]);
 

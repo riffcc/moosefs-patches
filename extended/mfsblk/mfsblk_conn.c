@@ -372,92 +372,22 @@ static int mfsblk_master_ensure_connected(struct mfsblk_dev *dev)
 	return ret;
 }
 
-static int mfsblk_master_lookup_path_locked(struct mfsblk_dev *dev, u32 *inode,
-					    u64 *size, u32 *parent_inode,
-					    char *leaf_name, size_t leaf_name_sz)
+static int mfsblk_master_simple_lookup_locked(struct mfsblk_dev *dev,
+					      const char *name, u32 *inode,
+					      u64 *size)
 {
-	u8 *req = NULL;
+	u8 req[8 + 17 + 255];
 	u8 *rsp = NULL;
 	u8 attr[36];
-	char register_subdir[MFSBLK_PATH_MAX];
-	const char *lookup_path;
-	size_t leaf_len = 0;
 	u32 msgid;
 	u32 rsp_type;
 	u32 rsp_len;
 	int req_len;
 	int ret;
-	size_t req_cap;
-
-	mfsblk_split_session_path(dev->image_path, register_subdir,
-				  sizeof(register_subdir), &lookup_path);
-	req_cap = 8 + 24 + strlen(lookup_path);
-
-	req = kmalloc(req_cap, GFP_NOIO);
-	if (!req)
-		return -ENOMEM;
 
 	msgid = (u32)atomic_inc_return(&dev->next_msgid);
-	req_len = mfsblk_proto_build_lookup_path_req(req, req_cap, msgid,
-						     lookup_path);
-	if (req_len < 0) {
-		ret = req_len;
-		goto out;
-	}
-
-	ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
-	if (ret) {
-		pr_err("mfsblk: PATH_LOOKUP send failed ret=%d path=%s lookup=%s\n",
-		       ret, dev->image_path, lookup_path);
-		goto out;
-	}
-
-	ret = mfsblk_recv_master_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
-	if (ret) {
-		pr_err("mfsblk: PATH_LOOKUP recv failed ret=%d path=%s lookup=%s\n",
-		       ret, dev->image_path, lookup_path);
-		goto out;
-	}
-
-	if (rsp_type != MFSBLK_MATOCL_PATH_LOOKUP) {
-		pr_err("mfsblk: PATH_LOOKUP unexpected rsp_type=%u rsp_len=%u path=%s lookup=%s\n",
-		       rsp_type, rsp_len, dev->image_path, lookup_path);
-		ret = -EPROTO;
-		goto out;
-	}
-
-	ret = mfsblk_proto_parse_lookup_path_rsp(rsp, rsp_len, msgid, parent_inode,
-						 inode, leaf_name, leaf_name_sz,
-						 &leaf_len, attr, sizeof(attr));
-	if (ret) {
-		pr_err("mfsblk: PATH_LOOKUP parse failed ret=%d rsp_len=%u path=%s lookup=%s\n",
-		       ret, rsp_len, dev->image_path, lookup_path);
-		goto out;
-	}
-	if (!ret) {
-		*size = (*inode != 0) ? mfsblk_proto_attr_size(attr, sizeof(attr)) : 0;
-		if (*inode != 0 && mfsblk_proto_attr_type(attr, sizeof(attr)) != 1)
-			ret = -EINVAL;
-	}
-out:
-	kvfree(rsp);
-	kfree(req);
-	return ret;
-}
-
-static int mfsblk_master_simple_lookup_locked(struct mfsblk_dev *dev,
-					      const char *name, u32 *inode,
-					      u64 *size)
-{
-	u8 req[8 + 13 + 255];
-	u8 *rsp = NULL;
-	u8 attr[36];
-	u32 rsp_type;
-	u32 rsp_len;
-	int req_len;
-	int ret;
-
-	req_len = mfsblk_proto_build_simple_lookup_req(req, sizeof(req), 1, name);
+	req_len = mfsblk_proto_build_simple_lookup_req(req, sizeof(req), msgid, 1,
+						       name);
 	if (req_len < 0)
 		return req_len;
 
@@ -482,8 +412,8 @@ static int mfsblk_master_simple_lookup_locked(struct mfsblk_dev *dev,
 		goto out;
 	}
 
-	ret = mfsblk_proto_parse_simple_lookup_rsp(rsp, rsp_len, inode, attr,
-						 sizeof(attr));
+	ret = mfsblk_proto_parse_simple_lookup_rsp(rsp, rsp_len, msgid, inode,
+						   attr, sizeof(attr));
 	if (ret) {
 		if (rsp_len == 1)
 			pr_err("mfsblk: SIMPLE_LOOKUP status=%u name=%s\n", rsp[0], name);
@@ -500,6 +430,54 @@ static int mfsblk_master_simple_lookup_locked(struct mfsblk_dev *dev,
 out:
 	kvfree(rsp);
 	return ret;
+}
+
+static int mfsblk_master_lookup_components_locked(struct mfsblk_dev *dev,
+						  const char *lookup_path,
+						  u32 *inode, u64 *size,
+						  u32 *parent_inode,
+						  char *leaf_name,
+						  size_t leaf_name_sz)
+{
+	char pathbuf[MFSBLK_PATH_MAX];
+	char *cursor;
+	char *component;
+	u32 current_inode = 1;
+	u64 current_size = 0;
+	int ret;
+
+	if (!lookup_path || !*lookup_path) {
+		if (inode)
+			*inode = 1;
+		if (size)
+			*size = 0;
+		if (parent_inode)
+			*parent_inode = 0;
+		if (leaf_name && leaf_name_sz)
+			leaf_name[0] = '\0';
+		return 0;
+	}
+
+	strscpy(pathbuf, lookup_path, sizeof(pathbuf));
+	cursor = pathbuf;
+	while ((component = strsep(&cursor, "/")) != NULL) {
+		if (!*component)
+			continue;
+		if (leaf_name && leaf_name_sz)
+			strscpy(leaf_name, component, leaf_name_sz);
+		if (parent_inode)
+			*parent_inode = current_inode;
+		ret = mfsblk_master_simple_lookup_locked(dev, component, &current_inode,
+							 &current_size);
+		if (ret)
+			return ret;
+	}
+
+	if (inode)
+		*inode = current_inode;
+	if (size)
+		*size = current_size;
+	return 0;
 }
 
 static int mfsblk_master_create_path_locked(struct mfsblk_dev *dev, u64 size,
@@ -640,14 +618,9 @@ int mfsblk_conn_resolve_image(struct mfsblk_dev *dev, bool inode_explicit,
 		return 0;
 	}
 
-	if (lookup_path[0] != '\0' && strchr(lookup_path, '/') == NULL) {
-		strscpy(leaf_name, lookup_path, sizeof(leaf_name));
-		parent_inode = 1;
-		ret = mfsblk_master_simple_lookup_locked(dev, lookup_path, &inode, &size);
-	} else {
-		ret = mfsblk_master_lookup_path_locked(dev, &inode, &size, &parent_inode,
-						       leaf_name, sizeof(leaf_name));
-	}
+	ret = mfsblk_master_lookup_components_locked(dev, lookup_path, &inode, &size,
+						     &parent_inode, leaf_name,
+						     sizeof(leaf_name));
 	if (!ret && inode == 0 && dev->size_bytes) {
 		ret = mfsblk_master_create_path_locked(dev, dev->size_bytes,
 						       parent_inode, leaf_name,
@@ -697,7 +670,6 @@ out_log:
 		pr_err("mfsblk: resolve_image path=%s inode=%u size=%llu ret=%d\n",
 		       dev->image_path, inode,
 		       (unsigned long long)(size ? size : dev->size_bytes), ret);
-out_unlock:
 	mutex_unlock(&dev->master_lock);
 	return ret;
 }
@@ -955,6 +927,12 @@ static int mfsblk_cs_read_one(struct mfsblk_cs_conn *conn,
 	if (req_len < 0)
 		return req_len;
 
+	if (!conn->sock) {
+		ret = mfsblk_open_socket(conn->ip, conn->port, &conn->sock);
+		if (ret)
+			return ret;
+	}
+
 	ret = mfsblk_sock_sendall(conn->sock, req, req_len);
 	if (ret)
 		return ret;
@@ -1095,6 +1073,12 @@ static int mfsblk_cs_write_one(struct mfsblk_cs_conn *conn,
 	pkt = kvmalloc(MFSBLK_MAX_PACKET, GFP_NOIO);
 	if (!pkt)
 		return -ENOMEM;
+
+	if (!conn->sock) {
+		ret = mfsblk_open_socket(conn->ip, conn->port, &conn->sock);
+		if (ret)
+			goto out;
+	}
 
 	pkt_len = mfsblk_proto_build_cs_write_init(pkt, MFSBLK_MAX_PACKET,
 					   chunk->chunk_id, chunk->version,

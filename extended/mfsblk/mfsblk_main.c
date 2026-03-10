@@ -220,15 +220,23 @@ static struct mfsblk_dev *mfsblk_find_one(const char *name)
 static int mfsblk_remove_one(const char *name)
 {
 	struct mfsblk_dev *found = NULL;
+	unsigned int openers = 0;
 
 	mutex_lock(&mfsblk_devices_lock);
 	found = mfsblk_find_one(name);
-	if (found)
+	if (found && found->disk)
+		openers = disk_openers(found->disk);
+	if (found && openers == 0)
 		list_del(&found->list);
 	mutex_unlock(&mfsblk_devices_lock);
 
 	if (!found)
 		return -ENOENT;
+	if (openers) {
+		pr_info("mfsblk: refusing remove of %s while %u opener(s) remain\n",
+			name, openers);
+		return -EBUSY;
+	}
 
 	ida_free(&mfsblk_ids, found->id);
 	mfsblk_dev_destroy(found);
