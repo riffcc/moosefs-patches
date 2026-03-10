@@ -85,6 +85,11 @@ Today this crate already supports:
   - exists/stat
   - unlink/rmdir
   - rename
+- an initial object namespace layer:
+  - deterministic shard-path mapping for object IDs
+  - object metadata probes
+  - positioned object reads and writes
+  - stream writes into MooseFS-backed objects
 - C ABI exports for userspace integration
 
 ## Current C ABI Shape
@@ -104,6 +109,26 @@ It currently exposes:
 
 That is enough to start wiring block- or object-oriented consumers without
 forcing every caller to fake local filesystem semantics themselves.
+
+## Native Object Layer
+
+The first real step beyond file-shaped helpers now exists as an object layer in
+`src/object.rs`.
+
+It still uses MooseFS files underneath, but it stops making downstream callers
+invent their own shard trees and object layout ad hoc. Instead, it gives them:
+
+- one deterministic object root
+- deterministic sharding like `/objects/ba/fy/<cid>.obj`
+- object-level `put/get/has/delete`
+- positioned object I/O on top of open MooseFS file handles
+- a place to evolve toward a more block-native substrate later
+
+This is intentionally the bridge step:
+
+- today: object API over positioned MooseFS file I/O
+- later: richer native block/object semantics without every downstream consumer
+  needing to rediscover the same layout and handle lifecycle rules
 
 ## Still Missing
 
