@@ -72,6 +72,7 @@ The rest remain important backlog, not discarded ideas.
 - env-gated integration with the flatfs multi-writer fork
 - Kubo/IPFS-HA dogfooding
 - other consumers that want MooseFS as a direct network storage substrate
+- IPFS HA acting as a storage-class orchestrator for MooseFS-backed objects
 
 ## Current Direction
 
@@ -84,3 +85,31 @@ The current architectural bias is:
 
 That means the older file-emulation goals are still valid context, but the
 center of gravity is shifting toward native storage semantics.
+
+## Future Direction: IPFS HA As Storage-Class Orchestrator
+
+Once the native object/block layer is real enough, IPFS HA becomes a natural
+policy engine for moving data between MooseFS storage classes automatically.
+
+The intended long-range shape is:
+
+- keep MooseFS Direct as the underlying transport
+- let object/block placement target explicit MooseFS classes or labels
+- promote hot objects toward faster classes
+- demote cold or archival objects toward cheaper classes
+- let replication, popularity, pinning intent, or tenant policy drive class
+  changes without changing visible CIDs
+
+Examples of the policy layer we want later:
+
+- fresh ingest lands on a fast write-oriented class first
+- frequently requested CIDs get promoted toward NVMe-oriented classes
+- archival or low-touch pins move toward cheaper durable classes
+- rebalancing can migrate class placement without forcing application-visible
+  renames or path changes
+
+This is intentionally a later orchestration concern, not a blocker for the
+current native Direct substrate work. But it is important enough to preserve
+explicitly now, because it is one of the biggest strategic advantages of making
+IPFS HA talk to MooseFS Direct as a real storage layer instead of a fake local
+filesystem.
