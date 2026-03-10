@@ -420,8 +420,12 @@ int mfsblk_dev_create(const struct mfsblk_map_spec *spec, struct mfsblk_dev **ou
 
 	ret = mfsblk_conn_resolve_image(dev, spec->inode_explicit,
 					spec->size_explicit);
-	if (ret)
+	if (ret) {
+		pr_err("mfsblk: resolve_image failed for %s (%s:%u %s): %d\n",
+		       dev->name, dev->master_host, dev->master_port,
+		       dev->image_path, ret);
 		goto err_free;
+	}
 
 	dev->io_wq = alloc_workqueue("mfsblk_io/%d", WQ_UNBOUND | WQ_MEM_RECLAIM,
 				    0, dev->id);
@@ -431,16 +435,23 @@ int mfsblk_dev_create(const struct mfsblk_map_spec *spec, struct mfsblk_dev **ou
 	}
 
 	ret = mfsblk_setup_queue(dev);
-	if (ret)
+	if (ret) {
+		pr_err("mfsblk: setup_queue failed for %s: %d\n", dev->name, ret);
 		goto err_wq;
+	}
 
 	ret = mfsblk_setup_disk(dev);
-	if (ret)
+	if (ret) {
+		pr_err("mfsblk: setup_disk failed for %s: %d\n", dev->name, ret);
 		goto err_queue;
+	}
 
 	ret = mfsblk_register_ctrl_dev(dev);
-	if (ret)
+	if (ret) {
+		pr_err("mfsblk: register_ctrl_dev failed for %s: %d\n",
+		       dev->name, ret);
 		goto err_disk;
+	}
 
 	*out = dev;
 	return 0;

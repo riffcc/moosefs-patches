@@ -332,6 +332,8 @@ static ssize_t add_store(const struct bus_type *bus, const char *buf, size_t cou
 	strim(spec);
 
 	ret = mfsblk_add_one(spec);
+	if (ret)
+		pr_err("mfsblk: add failed for spec '%s': %d\n", spec, ret);
 	kfree(spec);
 	if (ret)
 		return ret;

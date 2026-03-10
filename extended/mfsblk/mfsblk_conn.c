@@ -108,6 +108,52 @@ static int mfsblk_open_socket(u32 ip, u16 port, struct socket **out)
 	return 0;
 }
 
+static void mfsblk_split_session_path(const char *image_path, char *subdir,
+				      size_t subdir_sz, const char **lookup_path)
+{
+	const char *path = image_path;
+	const char *first;
+	const char *rest;
+	size_t sub_len;
+
+	if (!image_path || !*image_path) {
+		strscpy(subdir, "/", subdir_sz);
+		*lookup_path = "";
+		return;
+	}
+
+	while (*path == '/')
+		path++;
+	if (!*path) {
+		strscpy(subdir, "/", subdir_sz);
+		*lookup_path = "";
+		return;
+	}
+
+	first = path;
+	rest = strchr(first, '/');
+	if (!rest) {
+		strscpy(subdir, "/", subdir_sz);
+		*lookup_path = first;
+		return;
+	}
+
+	sub_len = (size_t)(rest - first);
+	if (sub_len + 2 > subdir_sz) {
+		strscpy(subdir, "/", subdir_sz);
+		*lookup_path = path;
+		return;
+	}
+
+	subdir[0] = '/';
+	memcpy(subdir + 1, first, sub_len);
+	subdir[sub_len + 1] = '\0';
+
+	while (*rest == '/')
+		rest++;
+	*lookup_path = rest;
+}
+
 static int mfsblk_sock_sendall(struct socket *sock, const void *buf, size_t len)
 {
 	struct msghdr msg = {};
@@ -210,6 +256,8 @@ static int mfsblk_master_register_locked(struct mfsblk_dev *dev)
 	u8 *rsp = NULL;
 	u8 challenge[32];
 	u8 passdigest[16];
+	char register_subdir[MFSBLK_PATH_MAX];
+	const char *lookup_path;
 	u32 rsp_type;
 	u32 rsp_len;
 	u32 master_version = 0;
@@ -220,19 +268,28 @@ static int mfsblk_master_register_locked(struct mfsblk_dev *dev)
 	if (dev->master_registered)
 		return 0;
 
+	mfsblk_split_session_path(dev->image_path, register_subdir,
+				  sizeof(register_subdir), &lookup_path);
+
 	if (dev->password[0]) {
 		req_len = mfsblk_proto_build_register_getrandom_req(req, sizeof(req));
 		if (req_len < 0)
 			return req_len;
 
 		ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
-		if (ret)
+		if (ret) {
+			pr_err("mfsblk: register getrandom send failed ret=%d\n", ret);
 			return ret;
+		}
 
 		ret = mfsblk_recv_master_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
-		if (ret)
+		if (ret) {
+			pr_err("mfsblk: register getrandom recv failed ret=%d\n", ret);
 			return ret;
+		}
 		if (rsp_type != MFSBLK_MATOCL_FUSE_REGISTER || rsp_len != 32) {
+			pr_err("mfsblk: register getrandom unexpected rsp_type=%u rsp_len=%u\n",
+			       rsp_type, rsp_len);
 			ret = -EPROTO;
 			goto out;
 		}
@@ -245,26 +302,39 @@ static int mfsblk_master_register_locked(struct mfsblk_dev *dev)
 			return ret;
 	}
 
-	req_len = mfsblk_proto_build_register_req(req, sizeof(req), "/",
+	req_len = mfsblk_proto_build_register_req(req, sizeof(req), register_subdir,
 						  dev->password[0] ? passdigest : NULL);
 	if (req_len < 0)
 		return req_len;
 
 	ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
-	if (ret)
+	if (ret) {
+		pr_err("mfsblk: register send failed ret=%d\n", ret);
 		return ret;
+	}
 
 	ret = mfsblk_recv_master_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
-	if (ret)
+	if (ret) {
+		pr_err("mfsblk: register recv failed ret=%d\n", ret);
 		return ret;
+	}
 
 	if (rsp_type != MFSBLK_MATOCL_FUSE_REGISTER) {
+		pr_err("mfsblk: register unexpected rsp_type=%u rsp_len=%u\n",
+		       rsp_type, rsp_len);
 		ret = -EPROTO;
 		goto out;
 	}
 
 	ret = mfsblk_proto_parse_register_rsp(rsp, rsp_len, &master_version,
 					      &session_id);
+	if (ret) {
+		if (rsp_len == 1)
+			pr_err("mfsblk: register status=%u\n", rsp[0]);
+		else
+			pr_err("mfsblk: register parse failed ret=%d rsp_len=%u\n",
+			       ret, rsp_len);
+	}
 	if (!ret) {
 		dev->master_version = master_version;
 		dev->master_session_id = session_id;
@@ -282,8 +352,11 @@ static int mfsblk_master_ensure_connected(struct mfsblk_dev *dev)
 	if (!dev->master_sock) {
 		ret = mfsblk_open_socket(dev->master_ip, dev->master_port,
 					 &dev->master_sock);
-		if (ret)
+		if (ret) {
+			pr_err("mfsblk: open master socket %s:%u failed ret=%d\n",
+			       dev->master_host, dev->master_port, ret);
 			return ret;
+		}
 		dev->master_registered = false;
 		dev->master_version = 0;
 		dev->master_session_id = 0;
@@ -291,6 +364,7 @@ static int mfsblk_master_ensure_connected(struct mfsblk_dev *dev)
 
 	ret = mfsblk_master_register_locked(dev);
 	if (ret) {
+		pr_err("mfsblk: master register failed ret=%d\n", ret);
 		mfsblk_close_socket(&dev->master_sock);
 		dev->master_registered = false;
 	}
@@ -305,13 +379,19 @@ static int mfsblk_master_lookup_path_locked(struct mfsblk_dev *dev, u32 *inode,
 	u8 *req = NULL;
 	u8 *rsp = NULL;
 	u8 attr[36];
+	char register_subdir[MFSBLK_PATH_MAX];
+	const char *lookup_path;
 	size_t leaf_len = 0;
 	u32 msgid;
 	u32 rsp_type;
 	u32 rsp_len;
 	int req_len;
 	int ret;
-	size_t req_cap = 8 + 24 + strlen(dev->image_path);
+	size_t req_cap;
+
+	mfsblk_split_session_path(dev->image_path, register_subdir,
+				  sizeof(register_subdir), &lookup_path);
+	req_cap = 8 + 24 + strlen(lookup_path);
 
 	req = kmalloc(req_cap, GFP_NOIO);
 	if (!req)
@@ -319,21 +399,29 @@ static int mfsblk_master_lookup_path_locked(struct mfsblk_dev *dev, u32 *inode,
 
 	msgid = (u32)atomic_inc_return(&dev->next_msgid);
 	req_len = mfsblk_proto_build_lookup_path_req(req, req_cap, msgid,
-						     dev->image_path);
+						     lookup_path);
 	if (req_len < 0) {
 		ret = req_len;
 		goto out;
 	}
 
 	ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
-	if (ret)
+	if (ret) {
+		pr_err("mfsblk: PATH_LOOKUP send failed ret=%d path=%s lookup=%s\n",
+		       ret, dev->image_path, lookup_path);
 		goto out;
+	}
 
 	ret = mfsblk_recv_master_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
-	if (ret)
+	if (ret) {
+		pr_err("mfsblk: PATH_LOOKUP recv failed ret=%d path=%s lookup=%s\n",
+		       ret, dev->image_path, lookup_path);
 		goto out;
+	}
 
 	if (rsp_type != MFSBLK_MATOCL_PATH_LOOKUP) {
+		pr_err("mfsblk: PATH_LOOKUP unexpected rsp_type=%u rsp_len=%u path=%s lookup=%s\n",
+		       rsp_type, rsp_len, dev->image_path, lookup_path);
 		ret = -EPROTO;
 		goto out;
 	}
@@ -341,6 +429,11 @@ static int mfsblk_master_lookup_path_locked(struct mfsblk_dev *dev, u32 *inode,
 	ret = mfsblk_proto_parse_lookup_path_rsp(rsp, rsp_len, msgid, parent_inode,
 						 inode, leaf_name, leaf_name_sz,
 						 &leaf_len, attr, sizeof(attr));
+	if (ret) {
+		pr_err("mfsblk: PATH_LOOKUP parse failed ret=%d rsp_len=%u path=%s lookup=%s\n",
+		       ret, rsp_len, dev->image_path, lookup_path);
+		goto out;
+	}
 	if (!ret) {
 		*size = (*inode != 0) ? mfsblk_proto_attr_size(attr, sizeof(attr)) : 0;
 		if (*inode != 0 && mfsblk_proto_attr_type(attr, sizeof(attr)) != 1)
@@ -349,6 +442,63 @@ static int mfsblk_master_lookup_path_locked(struct mfsblk_dev *dev, u32 *inode,
 out:
 	kvfree(rsp);
 	kfree(req);
+	return ret;
+}
+
+static int mfsblk_master_simple_lookup_locked(struct mfsblk_dev *dev,
+					      const char *name, u32 *inode,
+					      u64 *size)
+{
+	u8 req[8 + 13 + 255];
+	u8 *rsp = NULL;
+	u8 attr[36];
+	u32 rsp_type;
+	u32 rsp_len;
+	int req_len;
+	int ret;
+
+	req_len = mfsblk_proto_build_simple_lookup_req(req, sizeof(req), 1, name);
+	if (req_len < 0)
+		return req_len;
+
+	ret = mfsblk_sock_sendall(dev->master_sock, req, req_len);
+	if (ret) {
+		pr_err("mfsblk: SIMPLE_LOOKUP send failed ret=%d name=%s\n",
+		       ret, name);
+		goto out;
+	}
+
+	ret = mfsblk_recv_master_packet(dev->master_sock, &rsp_type, &rsp, &rsp_len);
+	if (ret) {
+		pr_err("mfsblk: SIMPLE_LOOKUP recv failed ret=%d name=%s\n",
+		       ret, name);
+		goto out;
+	}
+
+	if (rsp_type != MFSBLK_MATOCL_FUSE_LOOKUP) {
+		pr_err("mfsblk: SIMPLE_LOOKUP unexpected rsp_type=%u rsp_len=%u name=%s\n",
+		       rsp_type, rsp_len, name);
+		ret = -EPROTO;
+		goto out;
+	}
+
+	ret = mfsblk_proto_parse_simple_lookup_rsp(rsp, rsp_len, inode, attr,
+						 sizeof(attr));
+	if (ret) {
+		if (rsp_len == 1)
+			pr_err("mfsblk: SIMPLE_LOOKUP status=%u name=%s\n", rsp[0], name);
+		else
+			pr_err("mfsblk: SIMPLE_LOOKUP parse failed ret=%d rsp_len=%u name=%s\n",
+			       ret, rsp_len, name);
+		goto out;
+	}
+
+	*size = mfsblk_proto_attr_size(attr, sizeof(attr));
+	if (mfsblk_proto_attr_type(attr, sizeof(attr)) != 1)
+		ret = -EINVAL;
+
+out:
+	kvfree(rsp);
 	return ret;
 }
 
@@ -473,15 +623,31 @@ int mfsblk_conn_resolve_image(struct mfsblk_dev *dev, bool inode_explicit,
 	u64 size = 0;
 	u32 parent_inode = 0;
 	char leaf_name[256];
+	char register_subdir[MFSBLK_PATH_MAX];
+	const char *lookup_path;
 	int ret;
+
+	mfsblk_split_session_path(dev->image_path, register_subdir,
+				  sizeof(register_subdir), &lookup_path);
 
 	mutex_lock(&dev->master_lock);
 	ret = mfsblk_master_ensure_connected(dev);
 	if (ret)
-		goto out_unlock;
+		goto out_log;
 
-	ret = mfsblk_master_lookup_path_locked(dev, &inode, &size, &parent_inode,
-					       leaf_name, sizeof(leaf_name));
+	if (inode_explicit && size_explicit) {
+		mutex_unlock(&dev->master_lock);
+		return 0;
+	}
+
+	if (lookup_path[0] != '\0' && strchr(lookup_path, '/') == NULL) {
+		strscpy(leaf_name, lookup_path, sizeof(leaf_name));
+		parent_inode = 1;
+		ret = mfsblk_master_simple_lookup_locked(dev, lookup_path, &inode, &size);
+	} else {
+		ret = mfsblk_master_lookup_path_locked(dev, &inode, &size, &parent_inode,
+						       leaf_name, sizeof(leaf_name));
+	}
 	if (!ret && inode == 0 && dev->size_bytes) {
 		ret = mfsblk_master_create_path_locked(dev, dev->size_bytes,
 						       parent_inode, leaf_name,
@@ -515,7 +681,7 @@ int mfsblk_conn_resolve_image(struct mfsblk_dev *dev, bool inode_explicit,
 
 	if (!dev->size_bytes) {
 		ret = -EINVAL;
-		goto out_unlock;
+		goto out_log;
 	}
 
 	mutex_unlock(&dev->master_lock);
@@ -526,6 +692,11 @@ out_reset:
 	dev->master_registered = false;
 	dev->master_version = 0;
 	dev->master_session_id = 0;
+out_log:
+	if (ret)
+		pr_err("mfsblk: resolve_image path=%s inode=%u size=%llu ret=%d\n",
+		       dev->image_path, inode,
+		       (unsigned long long)(size ? size : dev->size_bytes), ret);
 out_unlock:
 	mutex_unlock(&dev->master_lock);
 	return ret;

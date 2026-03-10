@@ -40,6 +40,8 @@
 #define MFSBLK_REGISTER_NEWSESSION 2
 #define MFSBLK_CLTOMA_FUSE_REGISTER (MFSBLK_PROTO_BASE + 400)
 #define MFSBLK_MATOCL_FUSE_REGISTER (MFSBLK_PROTO_BASE + 401)
+#define MFSBLK_CLTOMA_FUSE_LOOKUP (MFSBLK_PROTO_BASE + 406)
+#define MFSBLK_MATOCL_FUSE_LOOKUP (MFSBLK_PROTO_BASE + 407)
 #define MFSBLK_CLTOMA_PATH_LOOKUP (MFSBLK_PROTO_BASE + 390)
 #define MFSBLK_MATOCL_PATH_LOOKUP (MFSBLK_PROTO_BASE + 391)
 #define MFSBLK_CLTOCS_READ (MFSBLK_PROTO_BASE + 200)
@@ -245,11 +247,15 @@ int mfsblk_proto_parse_register_rsp(const u8 *payload, size_t payload_sz,
 				    u32 *master_version, u32 *session_id);
 int mfsblk_proto_build_lookup_path_req(u8 *packet, size_t packet_sz, u32 msgid,
 				       const char *path);
+int mfsblk_proto_build_simple_lookup_req(u8 *packet, size_t packet_sz,
+					 u32 parent_inode, const char *name);
 int mfsblk_proto_parse_lookup_path_rsp(const u8 *payload, size_t payload_sz,
 				       u32 expected_msgid, u32 *parent_inode,
 				       u32 *inode, char *name, size_t name_sz,
 				       size_t *name_len, u8 *attr,
 				       size_t attr_sz);
+int mfsblk_proto_parse_simple_lookup_rsp(const u8 *payload, size_t payload_sz,
+					 u32 *inode, u8 *attr, size_t attr_sz);
 int mfsblk_proto_build_create_path_req(u8 *packet, size_t packet_sz, u32 msgid,
 				       u32 parent_inode, const char *name);
 int mfsblk_proto_parse_create_path_rsp(const u8 *payload, size_t payload_sz,

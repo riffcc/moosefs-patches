@@ -109,18 +109,20 @@ int mfsblk_proto_build_register_req(u8 *packet, size_t packet_sz,
 {
 	static const char blob[] =
 		"DjI1GAQDULI5d2YjA26ypc3ovkhjvhciTQVx3CS4nYgtBoUcsljiVpsErJENHaw0";
+	static const char info[] = "mfsblk";
 	const char *path = subdir ? subdir : "/";
+	size_t info_len = sizeof(info);
 	size_t path_len = strlen(path) + 1;
 	size_t extra = passdigest ? 16 : 0;
 	u8 *p = packet;
 
 	if (path_len > U32_MAX)
 		return -EINVAL;
-	if (mfsblk_check_buf(8 + 77 + path_len + extra, packet_sz))
+	if (mfsblk_check_buf(8 + 77 + info_len + path_len + extra, packet_sz))
 		return -EMSGSIZE;
 
 	mfsblk_proto_build_header(p, MFSBLK_CLTOMA_FUSE_REGISTER,
-				  77 + path_len + extra);
+				  77 + info_len + path_len + extra);
 	p += 8;
 	memcpy(p, blob, 64);
 	p += 64;
@@ -128,9 +130,11 @@ int mfsblk_proto_build_register_req(u8 *packet, size_t packet_sz,
 	put_unaligned_be16(4, p);
 	p += 2;
 	*p++ = 58;
-	*p++ = 6;
-	put_unaligned_be32(0, p); /* info length */
+	*p++ = 3;
+	put_unaligned_be32((u32)info_len, p);
 	p += 4;
+	memcpy(p, info, info_len);
+	p += info_len;
 	put_unaligned_be32((u32)path_len, p);
 	p += 4;
 	memcpy(p, path, path_len);
@@ -138,7 +142,7 @@ int mfsblk_proto_build_register_req(u8 *packet, size_t packet_sz,
 	if (passdigest)
 		memcpy(p, passdigest, 16);
 
-	return 8 + 77 + path_len + extra;
+	return 8 + 77 + info_len + path_len + extra;
 }
 
 u8 mfsblk_proto_attr_type(const u8 *attr, size_t attr_len)
@@ -195,15 +199,14 @@ int mfsblk_proto_build_lookup_path_req(u8 *packet, size_t packet_sz, u32 msgid,
 	size_t path_len = strlen(path);
 	u8 *p = packet;
 
+	(void)msgid;
 	if (path_len > U32_MAX)
 		return -EINVAL;
-	if (mfsblk_check_buf(8 + 24 + path_len, packet_sz))
+	if (mfsblk_check_buf(8 + 16 + path_len, packet_sz))
 		return -EMSGSIZE;
 
-	mfsblk_proto_build_header(p, MFSBLK_CLTOMA_PATH_LOOKUP, 24 + path_len);
+	mfsblk_proto_build_header(p, MFSBLK_CLTOMA_PATH_LOOKUP, 16 + path_len);
 	p += 8;
-	put_unaligned_be32(msgid, p);
-	p += 4;
 	put_unaligned_be32(1, p); /* root inode */
 	p += 4;
 	put_unaligned_be32((u32)path_len, p);
@@ -212,11 +215,34 @@ int mfsblk_proto_build_lookup_path_req(u8 *packet, size_t packet_sz, u32 msgid,
 	p += path_len;
 	put_unaligned_be32(0, p); /* uid=0 */
 	p += 4;
-	put_unaligned_be32(1, p);
-	p += 4;
-	put_unaligned_be32(0, p);
+	put_unaligned_be32(0xFFFFFFFFU, p); /* no gids */
 
-	return 8 + 24 + path_len;
+	return 8 + 16 + path_len;
+}
+
+int mfsblk_proto_build_simple_lookup_req(u8 *packet, size_t packet_sz,
+					 u32 parent_inode, const char *name)
+{
+	size_t name_len = strlen(name);
+	u8 *p = packet;
+
+	if (!name_len || name_len > 255)
+		return -EINVAL;
+	if (mfsblk_check_buf(8 + 13 + name_len, packet_sz))
+		return -EMSGSIZE;
+
+	mfsblk_proto_build_header(p, MFSBLK_CLTOMA_FUSE_LOOKUP, 13 + name_len);
+	p += 8;
+	put_unaligned_be32(parent_inode, p);
+	p += 4;
+	*p++ = (u8)name_len;
+	memcpy(p, name, name_len);
+	p += name_len;
+	put_unaligned_be32(0, p); /* uid=0 */
+	p += 4;
+	put_unaligned_be32(0xFFFFFFFFU, p); /* no gids */
+
+	return 8 + 13 + name_len;
 }
 
 int mfsblk_proto_parse_lookup_path_rsp(const u8 *payload, size_t payload_sz,
@@ -232,12 +258,10 @@ int mfsblk_proto_parse_lookup_path_rsp(const u8 *payload, size_t payload_sz,
 
 	if (!parent_inode || !inode || !name || !name_len || !attr)
 		return -EINVAL;
-	if (payload_sz < 5)
+	if (payload_sz < 1)
 		return -EPROTO;
-	if (get_unaligned_be32(p) != expected_msgid)
-		return -EPROTO;
-	p += 4;
-	rem = payload_sz - 4;
+	(void)expected_msgid;
+	rem = payload_sz;
 
 	if (rem == 1)
 		return mfsblk_proto_status_to_errno(*p);
@@ -263,6 +287,29 @@ int mfsblk_proto_parse_lookup_path_rsp(const u8 *payload, size_t payload_sz,
 		return -ENOSPC;
 	memcpy(attr, p, reply_attr_sz);
 
+	return 0;
+}
+
+int mfsblk_proto_parse_simple_lookup_rsp(const u8 *payload, size_t payload_sz,
+					 u32 *inode, u8 *attr, size_t attr_sz)
+{
+	size_t reply_attr_sz;
+
+	if (!inode || !attr)
+		return -EINVAL;
+	if (payload_sz < 1)
+		return -EPROTO;
+	if (payload_sz == 1)
+		return mfsblk_proto_status_to_errno(payload[0]);
+
+	if (payload_sz < 4 + 35)
+		return -EPROTO;
+
+	*inode = get_unaligned_be32(payload);
+	reply_attr_sz = (payload_sz >= 4 + 36) ? 36 : 35;
+	if (reply_attr_sz > attr_sz)
+		return -ENOSPC;
+	memcpy(attr, payload + 4, reply_attr_sz);
 	return 0;
 }
 
